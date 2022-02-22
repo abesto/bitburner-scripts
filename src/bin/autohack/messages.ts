@@ -23,6 +23,7 @@ export interface HackFinishedPayload {
     target: string;
     success: boolean;
     amount: number;
+    duration: number;
 }
 
 export interface WeakenFinishedPayload {
@@ -43,8 +44,8 @@ export function inflatePayload<T>(message: Message): T {
     return JSON.parse(message.payload);
 }
 
-export function hackFinished(target: string, success: boolean, amount: number): Message {
-    return messageWithPayload(MessageType.HackFinished, { target, success, amount });
+export function hackFinished(target: string, success: boolean, amount: number, duration: number): Message {
+    return messageWithPayload(MessageType.HackFinished, { target, success, amount, duration });
 }
 
 export function weakenFinished(target: string, amount: number): Message {
@@ -55,8 +56,12 @@ export function growFinished(target: string, amount: number): Message {
     return messageWithPayload(MessageType.GrowFinished, { target, amount });
 }
 
-export async function writeMessage(ns: NS, port: Port, message: Message): Promise<Message> {
-    return ns.writePort(port.valueOf(), JSON.stringify(message));
+export async function writeMessage(ns: NS, port: Port, message: Message): Promise<Message | null> {
+    const popped = await ns.writePort(port.valueOf(), JSON.stringify(message));
+    if (popped === null) {
+        return null;
+    }
+    return JSON.parse(popped);
 }
 
 export async function readMessage(ns: NS, port: Port): Promise<Message | null> {

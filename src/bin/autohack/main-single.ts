@@ -3,6 +3,8 @@ import { discoverHackedHosts } from 'lib/distributed';
 import { writeMessage, readMessage, MessageType, Message, inflatePayload, HackFinishedPayload, WeakenFinishedPayload, GrowFinishedPayload } from 'bin/autohack/messages';
 import { Port, Formats } from 'lib/constants';
 
+const TICK_LENGTH = 1000;
+
 async function deployWorkers(ns: NS, hostname: string): Promise<number> {
     const script = '/bin/autohack/worker.js';
     const freeMem = ns.getServerMaxRam(hostname) - ns.getServerUsedRam(hostname);
@@ -12,12 +14,15 @@ async function deployWorkers(ns: NS, hostname: string): Promise<number> {
         return 0;
     }
 
-    await ns.scp(ns.ls(ns.getHostname(), '/bin'), hostname);
-    await ns.scp(ns.ls(ns.getHostname(), '/lib'), hostname);
+    if (hostname !== ns.getHostname()) {
+        await ns.scp(ns.ls(ns.getHostname(), '/bin'), hostname);
+        await ns.scp(ns.ls(ns.getHostname(), '/lib'), hostname);
+    }
 
     for (let i = 0; i < workerCount; i++) {
-        await ns.exec(script, hostname, 1, `${i}`);
+        // Yield before each exec to work around https://github.com/danielyxie/bitburner/issues/1714
         await ns.sleep(0);
+        await ns.exec(script, hostname, 1, `${i}`);
     }
 
     ns.print(`Deployed ${workerCount} workers on ${hostname}`);
@@ -29,6 +34,7 @@ async function deployAllWorkers(ns: NS): Promise<number> {
     let sum = 0;
     for (const hostname of hosts) {
         sum += await deployWorkers(ns, hostname);
+        await ns.sleep(0);
     }
     ns.print(`Deployed ${sum} workers`);
     return sum;
@@ -62,6 +68,10 @@ class JobRegistry {
         this.limit = limit;
     }
 
+    count(hostname: string): number {
+        return (this.ends[hostname] || []).length;
+    }
+
     prune() {
         for (const hostname of Object.keys(this.ends)) {
             const ends = this.ends[hostname];
@@ -72,13 +82,15 @@ class JobRegistry {
         }
     }
 
-    async want(ns: NS, workerPool: Pool, count: number, length: number, message: Message): Promise<number> {
+    async want(ns: NS, workerPool: Pool, count: number, length: number, splayOver: number, message: Message): Promise<number> {
         this.prune();
         const ends = this.ends[message.payload] || [];
+        const existing = ends.length;
         const now = new Date().getTime();
-        const remaining = count - ends.length;
-        const want = Math.min(remaining, workerPool.workers * this.limit);
-        if (remaining > 0) {
+        const toMax = count - existing;
+        const splayed = Math.round(count / (splayOver / TICK_LENGTH));
+        const want = Math.min(toMax, splayed, workerPool.workers * this.limit);
+        if (want > 0) {
             const got = await workerPool.submit(ns, want, length, message);
             for (let i = 0; i < got; i++) {
                 ends.push(now + length);
@@ -130,7 +142,7 @@ async function deleteWeakestWorker(ns: NS, keep: number): Promise<boolean> {
         return a;
     });
     if (ns.getServerMaxRam(server) >= keep) {
-        ns.print(`Not deleting weakest worker, it's too big: ${server} (${ns.getServerMaxRam(server)}GB > ${keep}GB)`);
+        //ns.print(`Not deleting weakest worker, it's too big: ${server} (${ns.getServerMaxRam(server)}GB > ${keep}GB)`);
         return false;
     }
     ns.print(`Deleting weakest server: ${server} (${ns.getServerMaxRam(server)}GB)`);
@@ -157,9 +169,9 @@ async function purchaseWorkers(ns: NS): Promise<string[]> {
         while (ns.serverExists(`worker-${index}`)) {
             index += 1;
         }
-        ns.purchaseServer(`worker-${index}`, ram);
-        workers.push(`worker-${index}`);
-        ns.print(`Purchased worker-${index} with ${ram}GB RAM`);
+        const hostname = ns.purchaseServer(`worker-${index}`, ram);
+        workers.push(hostname);
+        ns.print(`Purchased ${hostname} with ${ram}GB RAM`);
     }
 
     return workers;
@@ -170,36 +182,38 @@ class Stats {
     hacksSucceeded = 0;
     hacksFailed = 0;
     hackedMoney = 0;
+    hacksDuration = 0;
 
     growsInProgress = 0;
     growsFinished = 0;
-    growAmount = 0.0;
+    growAmount = 1.0;
 
     weakensInProgress = 0;
     weakensFinished = 0;
     weakenAmount = 0.0;
 
     seconds = 0;
-    printEvery = 10;
 
     target: string
     targetMoneyRatio: number;
     targetSecurityLevel: number;
+    periodSeconds: number;
 
     moneyRatios: number[] = [];
     securityLevels: number[] = [];
 
-    constructor(target: string, targetMoneyRatio: number, targetSecurityLevel: number) {
+    constructor(target: string, targetMoneyRatio: number, targetSecurityLevel: number, periodSeconds: number) {
         this.target = target;
         this.targetMoneyRatio = targetMoneyRatio;
         this.targetSecurityLevel = targetSecurityLevel;
+        this.periodSeconds = periodSeconds;
     }
 
     async tick(ns: NS): Promise<void> {
         await this.processPort(ns);
         this.recordServerState(ns);
         this.seconds += 1;
-        if (this.seconds % this.printEvery === 0) {
+        if (this.seconds % this.periodSeconds === 0) {
             this.print(ns);
             this.reset()
         }
@@ -227,8 +241,9 @@ class Stats {
         this.hacksSucceeded = 0;
         this.hacksFailed = 0;
         this.hackedMoney = 0;
+        this.hacksDuration = 0;
         this.growsFinished = 0;
-        this.growAmount = 0.0;
+        this.growAmount = 1.0;
         this.weakensFinished = 0;
         this.weakenAmount = 0.0;
         this.seconds = 0;
@@ -248,6 +263,7 @@ class Stats {
                 if (payload.success) {
                     this.hacksSucceeded += 1;
                     this.hackedMoney += payload.amount;
+                    this.hacksDuration += payload.duration;
                 } else {
                     this.hacksFailed += 1;
                 }
@@ -256,7 +272,7 @@ class Stats {
 
             if (message.type === MessageType.GrowFinished) {
                 this.growsFinished += 1;
-                this.growAmount += inflatePayload<GrowFinishedPayload>(message).amount;
+                this.growAmount *= inflatePayload<GrowFinishedPayload>(message).amount;
                 this.growsInProgress -= 1;
             }
 
@@ -266,21 +282,25 @@ class Stats {
                 this.growsInProgress -= 1;
             }
         }
+
+        // Sometimes things get a bit weird, let's make them a bit less weird
+        this.weakensInProgress = Math.max(0, this.weakensInProgress);
+        this.hacksInProgress = Math.max(0, this.hacksInProgress);
+        this.growsInProgress = Math.max(0, this.growsInProgress);
     }
 
     print(ns: NS): void {
-        ns.print(`== Stats after ${ns.tFormat(this.printEvery * 1000)} ==`);
+        ns.print(`== Stats after ${ns.tFormat(this.seconds * 1000)} target:${this.target} ==`);
         ns.print(`[money-ratio] min=${ns.nFormat(Math.min(...this.moneyRatios), Formats.float)} max=${ns.nFormat(Math.max(...this.moneyRatios), Formats.float)} avg=${ns.nFormat(this.moneyRatios.reduce((a, b) => a + b, 0) / this.moneyRatios.length, Formats.float)} target=${ns.nFormat(this.targetMoneyRatio, Formats.float)}`);
-        ns.print(`[security] min=${ns.nFormat(Math.min(...this.securityLevels), Formats.float)} max=${ns.nFormat(Math.max(...this.securityLevels), Formats.float)} avg=${ns.nFormat(this.securityLevels.reduce((a, b) => a + b, 0) / this.securityLevels.length, Formats.float)} target=${ns.nFormat(this.targetSecurityLevel, Formats.float)}`);
-        ns.print(`[in-progress] hacks=${this.hacksInProgress} grows=${this.growsInProgress} weakens=${this.weakensInProgress}`);
-        if (this.hacksSucceeded > 0 || this.hacksFailed > 0) {
-            ns.print(`[hacks] succeeded=${this.hacksSucceeded} failed=${this.hacksFailed} money=${ns.nFormat(this.hackedMoney, Formats.money)} per-sec=${ns.nFormat(this.hackedMoney / this.printEvery, Formats.money)} avg(success)=${ns.nFormat(this.hackedMoney / this.hacksSucceeded, Formats.money)} avg(total)=${ns.nFormat(this.hackedMoney / (this.hacksSucceeded + this.hacksFailed), Formats.money)}`);
+        ns.print(`[   security] min=${ns.nFormat(Math.min(...this.securityLevels), Formats.float)} max=${ns.nFormat(Math.max(...this.securityLevels), Formats.float)} avg=${ns.nFormat(this.securityLevels.reduce((a, b) => a + b, 0) / this.securityLevels.length, Formats.float)} target=${ns.nFormat(this.targetSecurityLevel, Formats.float)}`);
+        if (this.hacksInProgress > 0 || this.hacksSucceeded > 0 || this.hacksFailed > 0) {
+            ns.print(`[      hacks] in-flight=${this.hacksInProgress} succeeded=${this.hacksSucceeded} failed=${this.hacksFailed} money=${ns.nFormat(this.hackedMoney, Formats.money)} per-sec=${ns.nFormat(this.hackedMoney / (this.hacksDuration / 1000), Formats.money)} avg=${ns.nFormat(this.hackedMoney / (this.hacksSucceeded + this.hacksFailed), Formats.money)}`);
         }
-        if (this.growsFinished > 0) {
-            ns.print(`[grows] finished=${this.growsFinished} amount=${ns.nFormat(this.growAmount, Formats.float)} per-sec=${ns.nFormat(this.growAmount / this.printEvery, Formats.float)} avg=${ns.nFormat(this.growAmount / this.growsFinished, Formats.float)}`);
+        if (this.growsFinished > 0 || this.growsInProgress > 0) {
+            ns.print(`[      grows] in-flight=${this.growsInProgress} finished=${this.growsFinished} amount=${ns.nFormat(this.growAmount, Formats.float)} avg=${ns.nFormat(this.growAmount / this.growsFinished, Formats.float)}`);
         }
-        if (this.weakensFinished > 0) {
-            ns.print(`[weakens] finished=${this.weakensFinished} amount=${ns.nFormat(this.weakenAmount, Formats.float)} per-sec=${ns.nFormat(this.weakenAmount / this.printEvery, Formats.float)} avg=${ns.nFormat(this.weakenAmount / this.weakensFinished, Formats.float)}`);
+        if (this.weakensFinished > 0 || this.weakensInProgress > 0) {
+            ns.print(`[    weakens] in-flight=${this.weakensInProgress} finished=${this.weakensFinished} amount=${ns.nFormat(this.weakenAmount, Formats.float)} per-sec=${ns.nFormat(this.weakenAmount / this.periodSeconds, Formats.float)} avg=${ns.nFormat(this.weakenAmount / this.weakensFinished, Formats.float)}`);
         }
     }
 }
@@ -303,40 +323,80 @@ export async function main(ns: NS): Promise<void> {
 
         const growRegistry = new JobRegistry(0.75);
         const weakenRegistry = new JobRegistry(0.75);
+        const hackRegistry = new JobRegistry(1);
         const workerPool = new Pool(workerCount);
 
         //const targetMoneyRatio = ns.getServerMoneyAvailable(hostname) / ns.getServerMaxMoney(hostname);
-        const targetMoneyRatio = 0.75;
-        const targetSecurityLevel = ns.getServerMinSecurityLevel(hostname) + 5;
+        const targetMoneyRatio = 0.9;
+        const targetSecurityLevel = ns.getServerMinSecurityLevel(hostname);
 
-        const stats = new Stats(hostname, targetMoneyRatio, targetSecurityLevel);
+        const stats = new Stats(hostname, targetMoneyRatio, targetSecurityLevel, parseInt(ns.read("/autohack/stats-period.txt") || "10"));
+        stats.recordServerState(ns);
+        stats.print(ns);
+
 
         while (true) {
+            const growTime = ns.getGrowTime(hostname);
+            const hackTime = ns.getHackTime(hostname);
+            const weakenTime = ns.getWeakenTime(hostname);
+            const maxHackJobs = Math.ceil(ns.getServerMaxMoney(hostname) * (1 - targetMoneyRatio) / (ns.getServerMaxMoney(hostname) * ns.hackAnalyze(hostname) * ns.hackAnalyzeChance(hostname)));
+            const moneyRatio = ns.getServerMoneyAvailable(hostname) / ns.getServerMaxMoney(hostname);
+            const splayOver = Math.max(growTime, hackTime, weakenTime);
+
+            const tickEnd = new Date().getTime() + TICK_LENGTH;
+
             for (const newServer of await purchaseWorkers(ns)) {
                 const newWorkerCount = await deployWorkers(ns, newServer);
                 workerPool.workers += newWorkerCount;
             }
 
-            if (targetSecurityLevel < ns.getServerSecurityLevel(hostname)) {
+            const moneyPerHack = ns.getServerMoneyAvailable(hostname) * ns.hackAnalyze(hostname) * ns.hackAnalyzeChance(hostname);
+            if (moneyRatio >= targetMoneyRatio) {
+                const targetAmount = ns.getServerMaxMoney(hostname) * (moneyRatio - targetMoneyRatio);
+                const hacksWanted = Math.ceil(targetAmount / moneyPerHack);
+
+                const hacksScheduled = await hackRegistry.want(ns, workerPool, hacksWanted, hackTime, splayOver, { type: MessageType.Hack, payload: hostname });
+                if (hacksScheduled > 0) {
+                    stats.recordHack(hacksScheduled);
+                    //ns.print(`[scheduled] ${hacksScheduled}/${hacksWanted} hack jobs against ${hostname} (time: ${ns.tFormat(hackTime)})`);
+                }
+            }
+
+            const moneyAfterHacks = ns.getServerMoneyAvailable(hostname) - moneyPerHack * hackRegistry.count(hostname);
+            let wantGrow: number;
+            if (moneyRatio < 1) {
+                const wantedMultiplier = ns.getServerMaxMoney(hostname) / moneyAfterHacks;
+                wantGrow = Math.ceil((ns.growthAnalyze(hostname, wantedMultiplier)));
+            } else {
+                wantGrow = 0;
+            }
+
+
+            const growSecurityCost = ns.growthAnalyzeSecurity(growRegistry.count(hostname));
+            const hackSecurityCost = ns.hackAnalyzeSecurity(hackRegistry.count(hostname));
+            const securityCost = growSecurityCost + hackSecurityCost;
+            let wantWeaken: number;
+            if (targetSecurityLevel < ns.getServerSecurityLevel(hostname) + securityCost) {
                 const weakenImpact = ns.weakenAnalyze(1, 1);
-                const wantedCount = Math.ceil(((ns.getServerSecurityLevel(hostname) - targetSecurityLevel) / weakenImpact) * (ns.getWeakenTime(hostname) / ns.getHackTime(hostname)));
-                const weakenTime = ns.getWeakenTime(hostname);
-                const newJobCount = await weakenRegistry.want(ns, workerPool, wantedCount, weakenTime, { type: MessageType.Weaken, payload: hostname });
+                wantWeaken = Math.ceil(((ns.getServerSecurityLevel(hostname) + securityCost - targetSecurityLevel) / weakenImpact));
+            } else {
+                wantWeaken = 0;
+            }
+
+            const finalWeaken = Math.ceil((workerPool.workers - maxHackJobs) * (wantWeaken / (wantWeaken + wantGrow)));
+            if (finalWeaken > 0) {
+                const newJobCount = await weakenRegistry.want(ns, workerPool, finalWeaken, weakenTime, splayOver, { type: MessageType.Weaken, payload: hostname });
                 if (newJobCount > 0) {
                     stats.recordWeaken(newJobCount);
                     //ns.print(`[scheduled] ${newJobCount}/${wantedCount} new weaken jobs for ${hostname} (time: ${ns.tFormat(weakenTime)})`);
                     //ns.print(`[security] ${ns.nFormat(ns.getServerSecurityLevel(hostname), Formats.float)} (target = ${targetSecurityLevel})`);
                 }
+
             }
 
-            const moneyRatio = ns.getServerMoneyAvailable(hostname) / ns.getServerMaxMoney(hostname);
-            if (moneyRatio < targetMoneyRatio) {
-                // available * x = max * TARGET
-                // x = max * TARGET / available
-                const wantedMultiplier = ns.getServerMaxMoney(hostname) * targetMoneyRatio / ns.getServerMoneyAvailable(hostname);
-                const wantedCount = Math.ceil((ns.growthAnalyze(hostname, wantedMultiplier)) * (ns.getGrowTime(hostname) / ns.getHackTime(hostname)));
-                const growTime = ns.getGrowTime(hostname);
-                const newJobCount = await growRegistry.want(ns, workerPool, wantedCount, growTime, { type: MessageType.Grow, payload: hostname });
+            const finalGrow = Math.ceil((workerPool.workers - maxHackJobs) * (wantGrow / (wantWeaken + wantGrow)));
+            if (finalGrow > 0) {
+                const newJobCount = await growRegistry.want(ns, workerPool, finalGrow, growTime, splayOver, { type: MessageType.Grow, payload: hostname });
                 if (newJobCount > 0) {
                     stats.recordGrow(newJobCount);
                     //ns.print(`[scheduled] ${newJobCount}/${wantedCount} new growth jobs for ${hostname} (time: ${ns.tFormat(growTime)})`);
@@ -344,16 +404,11 @@ export async function main(ns: NS): Promise<void> {
                 }
             }
 
-            const hackTime = ns.getHackTime(hostname);
-            const hacksWanted = Math.round(Math.max(10, Math.ceil(workerPool.workers / (hackTime / 1000))) * (moneyRatio / targetMoneyRatio));
-            const hacksScheduled = await workerPool.submit(ns, hacksWanted, hackTime, { type: MessageType.Hack, payload: hostname });
-            if (hacksScheduled > 0) {
-                stats.recordHack(hacksScheduled);
-                //ns.print(`[scheduled] ${hacksScheduled}/${hacksWanted} hack jobs against ${hostname} (time: ${ns.tFormat(hackTime)})`);
+            while (new Date().getTime() < tickEnd) {
+                await stats.processPort(ns);
+                await ns.sleep(50);
             }
-
             await stats.tick(ns);
-            await ns.sleep(1000);
         }
     }
 }
