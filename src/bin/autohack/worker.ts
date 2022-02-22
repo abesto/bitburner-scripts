@@ -1,44 +1,60 @@
-import { NS } from '@ns'
+import { NS } from '@ns';
+
+import {
+  Message,
+  MessageType as MT,
+  readMessage,
+  writeMessage,
+} from 'bin/autohack/messages';
 import { Port } from 'lib/constants';
-import { readMessage, writeMessage, MessageType, Message, hackFinished, weakenFinished, growFinished } from 'bin/autohack/messages';
+import { timed } from 'lib/time';
+
+const splay = Math.random() * 10;
 
 async function send(ns: NS, messageIn: Message): Promise<void> {
-    let message: Message | null = messageIn;
-    while (true) {
-        message = await writeMessage(ns, Port.AutohackResponse, message);
-        if (message === null) {
-            break;
-        }
-        ns.print("Resend :(");
-        await ns.sleep(Math.random() * 500);
+  let message: Message | null = messageIn;
+  while (true) {
+    message = await writeMessage(ns, Port.AutohackResponse, message);
+    if (message === null) {
+      break;
     }
+    ns.print('Resend :(');
+    await ns.sleep(Math.random() * splay);
+  }
 }
 
 export async function main(ns: NS): Promise<void> {
-    ns.disableLog("sleep");
+  ns.disableLog('sleep');
+  const workerIndex = parseInt(ns.args[0] as string);
+  const workerData = { workerHost: ns.getHostname(), workerIndex };
 
-    while (true) {
-        const message = await readMessage(ns, Port.AutohackCommand);
+  while (true) {
+    const message = await readMessage(ns, Port.AutohackCommand);
 
-        if (message === null) {
-            await ns.sleep(100);
-            continue;
-        }
-
-        if (message.type === MessageType.Hack) {
-            const start = new Date().getTime();
-            const amount = await ns.hack(message.payload);
-            const end = new Date().getTime();
-            const duration = end - start;
-            await send(ns, hackFinished(message.payload, amount > 0, amount, duration));
-        } else if (message.type === MessageType.Weaken) {
-            const amount = await ns.weaken(message.payload);
-            await send(ns, weakenFinished(message.payload, amount));
-        } else if (message.type === MessageType.Grow) {
-            const amount = await ns.grow(message.payload);
-            await send(ns, growFinished(message.payload, amount));
-        } else if (message.type === MessageType.Shutdown) {
-            break;
-        }
+    if (message === null) {
+      await ns.sleep(100 + splay);
+      continue;
     }
+
+    if (message.type === MT.HackRequest) {
+      const target = message.target;
+      await send(ns, { type: MT.HackStarted, target, ...workerData });
+      const { retval: amount, duration } = await timed(ns.hack(target));
+      await send(ns, { type: MT.HackFinished, target, success: amount > 0, amount, duration, ...workerData });
+    } else if (message.type === MT.WeakenRequest) {
+      const target = message.target;
+      await send(ns, { type: MT.WeakenStarted, target, ...workerData });
+      const { retval: amount, duration } = await timed(ns.weaken(target));
+      await send(ns, { type: MT.WeakenFinished, target, amount, duration, ...workerData });
+    } else if (message.type === MT.GrowRequest) {
+      const target = message.target;
+      await send(ns, { type: MT.GrowStarted, target, ...workerData });
+      const { retval: amount, duration } = await timed(ns.grow(target));
+      await send(ns, { type: MT.GrowFinished, target, amount, duration, ...workerData });
+    } else if (message.type === MT.Shutdown) {
+      break;
+    } else {
+      ns.print(`Unknown message: ${JSON.stringify(message)}`);
+    }
+  }
 }

@@ -23,7 +23,11 @@
     "@typescript-eslint/eslint-plugin": "^4.28.4",
     "@typescript-eslint/parser": "^4.28.4",
     "eslint": "^7.31.0",
+    "prettier": "^2.5.1",
     "ts-node": "^9.1.1",
     "typescript": "^4.3.5"
+  },
+  "dependencies": {
+    "ts-pattern": "^3.3.5"
   }
 }

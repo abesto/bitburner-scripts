@@ -1,7 +1,10 @@
 {
     "recommendations": [
         "dbaeumer.vscode-eslint",
-        "Gruntfuggly.auto-snippet",
-        "bitburner.bitburner-vscode-integration"
+        "gruntfuggly.auto-snippet",
+        "bitburner.bitburner-vscode-integration",
+        "esbenp.prettier-vscode",
+        "mike-co.import-sorter",
+        "stkb.rewrap"
     ]
 }

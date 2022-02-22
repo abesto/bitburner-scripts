@@ -2,59 +2,49 @@ import { NS } from '@ns'
 import { Port } from 'lib/constants';
 
 export const enum MessageType {
-    Hack,
-    HackFinished,
+    HackRequest = 'hack-request',
+    HackStarted = 'hack-started',
+    HackFinished = 'hack-finished',
 
-    Weaken,
-    WeakenFinished,
+    WeakenRequest = 'weaken-request',
+    WeakenStarted = 'weaken-started',
+    WeakenFinished = 'weaken-finished',
 
-    Grow,
-    GrowFinished,
+    GrowRequest = 'grow-request',
+    GrowStarted = 'grow-started',
+    GrowFinished = 'grow-finished',
 
-    Shutdown
+    Shutdown = 'shutdown',
 }
 
-export interface Message {
-    type: MessageType;
-    payload: string;
+export type Worker = {
+    workerHost: string;
+    workerIndex: number;
 }
 
-export interface HackFinishedPayload {
+type RequestCommon = {
     target: string;
-    success: boolean;
-    amount: number;
-    duration: number;
 }
 
-export interface WeakenFinishedPayload {
-    target: string;
-    amount: number;
-}
+type StartedCommon = Worker & { target: string; }
 
-export interface GrowFinishedPayload {
-    target: string;
-    amount: number;
-}
+type FinishedCommon = StartedCommon & { amount: number, duration: number };
 
-export function messageWithPayload<T>(type: MessageType, payload: T): Message {
-    return { type, payload: JSON.stringify(payload) };
-}
-
-export function inflatePayload<T>(message: Message): T {
-    return JSON.parse(message.payload);
-}
-
-export function hackFinished(target: string, success: boolean, amount: number, duration: number): Message {
-    return messageWithPayload(MessageType.HackFinished, { target, success, amount, duration });
-}
-
-export function weakenFinished(target: string, amount: number): Message {
-    return messageWithPayload(MessageType.WeakenFinished, { target, amount });
-}
-
-export function growFinished(target: string, amount: number): Message {
-    return messageWithPayload(MessageType.GrowFinished, { target, amount });
-}
+export type Message =
+    // Hack
+    | { type: MessageType.HackRequest } & RequestCommon
+    | { type: MessageType.HackStarted } & StartedCommon
+    | { type: MessageType.HackFinished; success: boolean } & FinishedCommon
+    // Weaken
+    | { type: MessageType.WeakenRequest } & RequestCommon
+    | { type: MessageType.WeakenStarted } & StartedCommon
+    | { type: MessageType.WeakenFinished } & FinishedCommon
+    // Grow
+    | { type: MessageType.GrowRequest } & RequestCommon
+    | { type: MessageType.GrowStarted } & StartedCommon
+    | { type: MessageType.GrowFinished } & FinishedCommon
+    // Shutdown
+    | { type: MessageType.Shutdown };
 
 export async function writeMessage(ns: NS, port: Port, message: Message): Promise<Message | null> {
     const popped = await ns.writePort(port.valueOf(), JSON.stringify(message));
