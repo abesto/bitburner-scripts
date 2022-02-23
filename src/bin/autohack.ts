@@ -18,6 +18,7 @@ interface Config {
   targetMoneyRatio: number;
   reservedRam: number;
   target: string;
+  workerScript: string;
 }
 
 const DEFAULT_CONFIG: Config = {
@@ -28,6 +29,7 @@ const DEFAULT_CONFIG: Config = {
   targetMoneyRatio: 0.75,
   reservedRam: 16,
   target: 'n00dles',
+  workerScript: '/bin/autohack/worker.js',
 };
 
 const CONFIG = DEFAULT_CONFIG;
@@ -37,24 +39,26 @@ function loadConfig(ns: NS) {
   Object.assign(CONFIG, config);
 }
 
-async function deployWorkers(ns: NS, hostname: string): Promise<number> {
-  const script = '/bin/autohack/worker.js';
-  const freeMem = ns.getServerMaxRam(hostname) - ns.getServerUsedRam(hostname);
-  const reservedMem = hostname === ns.getHostname() ? CONFIG.reservedRam : 0;
-  const workerCount = Math.floor((freeMem - reservedMem) / ns.getScriptRam(script));
-  if (workerCount < 1) {
-    return 0;
-  }
-
+async function scp(ns: NS, hostname: string): Promise<void> {
   if (hostname !== ns.getHostname()) {
     await ns.scp(ns.ls(ns.getHostname(), '/bin'), hostname);
     await ns.scp(ns.ls(ns.getHostname(), '/lib'), hostname);
   }
+  await ns.asleep(0);
+}
+
+async function startWorkers(ns: NS, hostname: string): Promise<number> {
+  const freeMem = ns.getServerMaxRam(hostname) - ns.getServerUsedRam(hostname);
+  const reservedMem = hostname === ns.getHostname() ? CONFIG.reservedRam : 0;
+  const workerCount = Math.floor((freeMem - reservedMem) / ns.getScriptRam(CONFIG.workerScript));
+  if (workerCount < 1) {
+    return 0;
+  }
 
   for (let i = 0; i < workerCount; i++) {
     // Yield before each exec to work around https://github.com/danielyxie/bitburner/issues/1714
-    await ns.sleep(0);
-    await ns.exec(script, hostname, 1, `${i}`);
+    await ns.asleep(0);
+    await ns.exec(CONFIG.workerScript, hostname, 1, `${i}`);
   }
 
   ns.print(`Deployed ${workerCount} workers on ${hostname}`);
@@ -64,8 +68,9 @@ async function deployWorkers(ns: NS, hostname: string): Promise<number> {
 async function deployAllWorkers(ns: NS, pool: Pool): Promise<void> {
   const hosts = discoverHackedHosts(ns);
   for (const hostname of hosts) {
-    pool.setWorkerCount(hostname, await deployWorkers(ns, hostname));
-    await ns.sleep(0);
+    await scp(ns, hostname);
+    pool.setWorkerCount(hostname, await startWorkers(ns, hostname));
+    await ns.asleep(0);
   }
   ns.print(`Deployed ${pool.getWorkerCount()} workers`);
 }
@@ -247,7 +252,7 @@ class Pool {
       // Stop regularly to read our input port
       if (i % 5 === 0) {
         await drainInbox();
-        await ns.sleep(0);
+        await ns.asleep(0);
       }
     }
   }
@@ -509,18 +514,15 @@ export async function main(ns: NS): Promise<void> {
       // Splay jobs to establish a steady stream of changes, which makes it easier for the orchestrator to react to
       // changes. EXCEPT if we're in the (initial) phase of super-low available money, in which case we'll just throw
       // everything at it, and disable hacks.
-      const splay = moneyRatio >= CONFIG.targetMoneyRatio * 0.75;
+      const splay = moneyRatio >= CONFIG.targetMoneyRatio ** 2;
 
       // We'll reserve workers for this many hack jobs
       const maxHackJobs = splay
         ? Math.ceil(
-            Math.min(
-              workerPool.getWorkerCount() * 0.3,
-              (ns.getServerMaxMoney(CONFIG.target) * (1 - CONFIG.targetMoneyRatio)) /
-                (ns.getServerMaxMoney(CONFIG.target) *
-                  ns.hackAnalyze(CONFIG.target) *
-                  ns.hackAnalyzeChance(CONFIG.target)),
-            ),
+            (ns.getServerMaxMoney(CONFIG.target) * (1 - CONFIG.targetMoneyRatio)) /
+              (ns.getServerMaxMoney(CONFIG.target) *
+                ns.hackAnalyze(CONFIG.target) *
+                ns.hackAnalyzeChance(CONFIG.target)),
           )
         : 0;
 
@@ -531,27 +533,23 @@ export async function main(ns: NS): Promise<void> {
         jobRegistry.hostKilled(s);
       }
       for (const s of purchased) {
-        const newWorkerCount = await deployWorkers(ns, s);
+        await scp(ns, s);
+        const newWorkerCount = await startWorkers(ns, s);
         workerPool.setWorkerCount(s, newWorkerCount);
       }
 
-      // Schedule hacks
+      // Ideal number of hacks
       const moneyPerHack =
         ns.getServerMoneyAvailable(CONFIG.target) * ns.hackAnalyze(CONFIG.target) * ns.hackAnalyzeChance(CONFIG.target);
+      let wantHack: number;
       if (moneyRatio >= CONFIG.targetMoneyRatio) {
         const targetAmount = ns.getServerMaxMoney(CONFIG.target) * (moneyRatio - CONFIG.targetMoneyRatio);
-        const hacksWanted = Math.min(maxHackJobs, Math.ceil(targetAmount / moneyPerHack));
-        //ns.tprint(`${maxHackJobs} ${hacksWanted} ${moneyPerHack} ${targetAmount}`);
-        await jobRegistry.want(ns, drainInbox, {
-          count: hacksWanted,
-          length: hackTime,
-          splay,
-          type: MT.HackRequest,
-          target: CONFIG.target,
-        });
+        wantHack = Math.min(maxHackJobs, Math.round(targetAmount / moneyPerHack));
+      } else {
+        wantHack = 0;
       }
 
-      // Compute the amount of growth we need
+      // Compute the amount of growth we need to support ideal number of hacks
       const moneyAfterHacks =
         ns.getServerMoneyAvailable(CONFIG.target) - moneyPerHack * jobRegistry.count(CONFIG.target, MT.HackRequest);
       let wantGrow: number;
@@ -573,6 +571,29 @@ export async function main(ns: NS): Promise<void> {
         wantWeaken = Math.ceil(wantedSecurityDecrease / weakenImpact);
       } else {
         wantWeaken = 0;
+      }
+
+      // Limit hack load to grow load
+      const haveGrow = jobRegistry.count(CONFIG.target, MT.GrowRequest);
+      const finalHacks = Math.round(wantHack * Math.min(1, wantGrow ? haveGrow / wantGrow : 1));
+      /*
+      ns.tprint(
+        `want=${wantHack} wantGrow=${wantGrow} haveGrow=${jobRegistry.count(
+          CONFIG.target,
+          MT.GrowRequest,
+        )} finalHack=${finalHacks}`,
+      );
+      */
+      // Schedule hacks
+      if (finalHacks > 0) {
+        //ns.tprint(`${maxHackJobs} ${hacksWanted} ${moneyPerHack} ${targetAmount}`);
+        await jobRegistry.want(ns, drainInbox, {
+          count: wantHack,
+          length: hackTime,
+          splay,
+          type: MT.HackRequest,
+          target: CONFIG.target,
+        });
       }
 
       // Let weaken and grow jobs take up all capacity not reserved for hack jobs
@@ -614,7 +635,7 @@ export async function main(ns: NS): Promise<void> {
 
       while (new Date().getTime() < tickEnd) {
         await drainInbox();
-        await ns.sleep(50);
+        await ns.asleep(50);
       }
       await stats.tick(ns);
     }
