@@ -17,7 +17,12 @@ function getFullGrowTime(ns: NS, hostname: string, workers: number): number {
 export async function main(ns: NS): Promise<void> {
   const hosts = discoverHackedHosts(ns);
   const workers = discoverHackedHosts(ns)
-    .map(host => ns.ps(host).filter(p => p.filename === '/bin/autohack/worker.js').length)
+    .flatMap(host =>
+      ns
+        .ps(host)
+        .filter(p => p.filename.startsWith('/bin/autohack/executor_scripts/'))
+        .map(p => p.threads),
+    )
     .reduce((a, b) => a + b, 0);
   hosts.sort((a, b) => getFullGrowTime(ns, a, workers) - getFullGrowTime(ns, b, workers));
   for (const host of hosts) {

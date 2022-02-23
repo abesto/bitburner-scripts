@@ -1,86 +1,19 @@
 import { NS } from '@ns';
 
+import { CONFIG, loadConfig } from 'bin/autohack/config';
 import {
-  Message,
-  MessageType as MT,
-  readMessage,
-  writeMessage,
-} from 'bin/autohack/messages';
-import { Formats, Port } from 'lib/constants';
+  Executor,
+  JobType,
+  Result,
+  scriptDir as executorScriptDir,
+} from 'bin/autohack/executor';
 import { discoverHackedHosts } from 'lib/distributed';
 import * as fmt from 'lib/fmt';
-
-interface Config {
-  tickLength: number;
-  statsPeriod: number;
-  purchaseRam: number;
-  reservedMoney: number;
-  targetMoneyRatio: number;
-  reservedRam: number;
-  target: string;
-  workerScript: string;
-}
-
-const DEFAULT_CONFIG: Config = {
-  tickLength: 1000,
-  statsPeriod: 30000,
-  purchaseRam: 64,
-  reservedMoney: 0,
-  targetMoneyRatio: 0.75,
-  reservedRam: 16,
-  target: 'n00dles',
-  workerScript: '/bin/autohack/worker.js',
-};
-
-const CONFIG = DEFAULT_CONFIG;
-
-function loadConfig(ns: NS) {
-  const config = JSON.parse(ns.read('/autohack/config.txt') || '{}') as Config;
-  Object.assign(CONFIG, config);
-}
-
-async function scp(ns: NS, hostname: string): Promise<void> {
-  if (hostname !== ns.getHostname()) {
-    await ns.scp(ns.ls(ns.getHostname(), '/bin'), hostname);
-    await ns.scp(ns.ls(ns.getHostname(), '/lib'), hostname);
-  }
-  await ns.asleep(0);
-}
-
-async function startWorkers(ns: NS, hostname: string): Promise<number> {
-  const freeMem = ns.getServerMaxRam(hostname) - ns.getServerUsedRam(hostname);
-  const reservedMem = hostname === ns.getHostname() ? CONFIG.reservedRam : 0;
-  const workerCount = Math.floor((freeMem - reservedMem) / ns.getScriptRam(CONFIG.workerScript));
-  if (workerCount < 1) {
-    return 0;
-  }
-
-  for (let i = 0; i < workerCount; i++) {
-    // Yield before each exec to work around https://github.com/danielyxie/bitburner/issues/1714
-    if (i < 5) {
-      await ns.asleep(0);
-    }
-    await ns.exec(CONFIG.workerScript, hostname, 1, `${i}`);
-  }
-
-  ns.print(`Deployed ${workerCount} workers on ${hostname}`);
-  return workerCount;
-}
-
-async function deployAllWorkers(ns: NS, pool: Pool): Promise<void> {
-  const hosts = discoverHackedHosts(ns);
-  for (const hostname of hosts) {
-    await scp(ns, hostname);
-    pool.setWorkerCount(hostname, await startWorkers(ns, hostname));
-    await ns.asleep(0);
-  }
-  ns.print(`Deployed ${pool.getWorkerCount()} workers`);
-}
 
 async function killWorkersOnHost(ns: NS, host: string): Promise<number> {
   let killed = 0;
   for (const process of ns.ps(host)) {
-    if (process.filename == '/bin/autohack/worker.js') {
+    if (process.filename == '/bin/autohack/worker.js' || process.filename.startsWith(executorScriptDir)) {
       await ns.kill(process.filename, host, ...process.args);
       killed += 1;
     }
@@ -97,13 +30,6 @@ async function killWorkers(ns: NS): Promise<void> {
   ns.print(`Killed ${killed} workers`);
 }
 
-type JobInFlight = {
-  type: JobType;
-  target: string;
-};
-
-type JobType = MT.GrowRequest | MT.HackRequest | MT.WeakenRequest;
-
 interface JobRequest {
   target: string;
   type: JobType;
@@ -112,151 +38,30 @@ interface JobRequest {
   splay: boolean;
 }
 
-class JobRegistry {
-  private jobs: Map<string, JobInFlight> = new Map();
-  private pool: Pool;
+class Splayed {
+  constructor(private executor: Executor) {}
 
-  constructor(pool: Pool) {
-    this.pool = pool;
-  }
+  async exec(ns: NS, req: JobRequest): Promise<number> {
+    const existing = this.executor.countThreads(req.target, req.type);
+    const toRequested = req.count - existing;
 
-  count(target: string, type: JobType): number {
-    return [...this.jobs.values()].filter(job => job.target === target && job.type === type).length;
-  }
+    const splayedPerTick = req.splay
+      ? Math.round(req.count / (req.length / CONFIG.tickLength))
+      : Number.POSITIVE_INFINITY;
 
-  countByType(type: JobType): number {
-    return [...this.jobs.values()].filter(job => job.type === type).length;
-  }
-
-  countAll(): number {
-    return [...this.jobs.values()].length;
-  }
-
-  getWorkerCount(): number {
-    return this.pool.getWorkerCount();
-  }
-
-  hostKilled(host: string): void {
-    for (const worker of this.jobs.keys()) {
-      if (worker.startsWith(`${host}:`)) {
-        this.jobs.delete(worker);
-      }
-    }
-  }
-
-  async want(ns: NS, drainInbox: () => Promise<void>, req: JobRequest): Promise<number> {
-    const existing = this.count(req.target, req.type);
-    const toMax = req.count - existing;
-    const splayed = req.splay ? Math.round(req.count / (req.length / CONFIG.tickLength)) : Number.POSITIVE_INFINITY;
-    const available = this.pool.getWorkerCount() * 0.9 - this.countAll();
-    const want = Math.min(toMax, splayed, available);
-    if (req.type === MT.HackRequest) {
-      //ns.tprint(`${want} ${toMax} ${splayed} ${available} ${existing}`);
+    const want = Math.min(toRequested, splayedPerTick);
+    if (req.type === JobType.Hack) {
+      /*
+      ns
+        .tprint(
+        `want=${want} req=${req.count} existing=${existing} toRequested=${toRequested} splayedPerTick=${splayedPerTick}`,
+        );
+        */
     }
     if (want > 0) {
-      await this.pool.submit(ns, want, length, { type: req.type, target: req.target }, drainInbox);
+      return await this.executor.exec(ns, req.target, req.type, want);
     }
-    return want;
-  }
-
-  recordJobStarted(ns: NS, workerHost: string, workerIndex: number, type: JobType, target: string): void {
-    const worker = `${workerHost}:${workerIndex}`;
-    /*
-    if (this.jobs.has(worker)) {
-      ns.print(
-        `${workerHost}:${workerIndex} reports it started ${type} against ${target}, but we already have a job for it: ${JSON.stringify(
-          this.jobs.get(worker),
-        )}. Dropping the old job from the registry.`,
-      );
-    }
-    */
-    this.jobs.set(worker, { type, target });
-  }
-
-  recordJobFinished(ns: NS, workerHost: string, workerIndex: number, type: JobType, target: string): void {
-    const worker = `${workerHost}:${workerIndex}`;
-    const job = this.jobs.get(worker);
-    if (job === undefined) {
-      //ns.print(`${workerHost}:${workerIndex} reports it finished a ${type}, but we don't have a job for it.`);
-      return;
-    }
-    /*
-    if (job.type !== type) {
-      ns.print(`${workerHost}:${workerIndex} reports it finished a ${type}, but we have a ${job.type} job for it.`);
-    }
-    if (job.target !== target) {
-      ns.print(
-        `${workerHost}:${workerIndex} reports it finished ${type} against ${target}, but we have a ${job.target} job for it.`,
-      );
-    }
-    */
-    this.jobs.delete(worker);
-  }
-
-  handleMessage(ns: NS, message: Message): void {
-    if (message.type === MT.HackStarted || message.type === MT.WeakenStarted || message.type === MT.GrowStarted) {
-      let jobType: JobType;
-      if (message.type === MT.HackStarted) {
-        jobType = MT.HackRequest;
-      } else if (message.type === MT.WeakenStarted) {
-        jobType = MT.WeakenRequest;
-      } else if (message.type === MT.GrowStarted) {
-        jobType = MT.GrowRequest;
-      } else {
-        throw new Error('This code is unreachable');
-      }
-      this.recordJobStarted(ns, message.workerHost, message.workerIndex, jobType, message.target);
-    } else if (
-      message.type === MT.HackFinished ||
-      message.type === MT.WeakenFinished ||
-      message.type === MT.GrowFinished
-    ) {
-      let jobType: JobType;
-      if (message.type === MT.HackFinished) {
-        jobType = MT.HackRequest;
-      } else if (message.type === MT.WeakenFinished) {
-        jobType = MT.WeakenRequest;
-      } else if (message.type === MT.GrowFinished) {
-        jobType = MT.GrowRequest;
-      } else {
-        throw new Error('This code is literally unreachable, wtf');
-      }
-      this.recordJobFinished(ns, message.workerHost, message.workerIndex, jobType, message.target);
-    }
-  }
-}
-
-class Pool {
-  private workers: { [hostname: string]: number } = {};
-
-  setWorkerCount(hostname: string, count: number): void {
-    this.workers[hostname] = count;
-  }
-
-  getWorkerCount(): number {
-    return Object.values(this.workers).reduce((a, b) => a + b, 0);
-  }
-
-  delete(hostname: string): void {
-    delete this.workers[hostname];
-  }
-
-  async submit(
-    ns: NS,
-    count: number,
-    length: number,
-    message: Message,
-    drainInbox: () => Promise<void>,
-  ): Promise<void> {
-    for (let i = 0; i < count; i++) {
-      // Ignore if the queue is full, drop items from it. Better than blocking further work.
-      await writeMessage(ns, Port.AutohackCommand, message);
-      // Stop regularly to read our input port
-      if (i % 5 === 0) {
-        await drainInbox();
-        await ns.asleep(0);
-      }
-    }
+    return 0;
   }
 }
 
@@ -312,39 +117,36 @@ async function purchaseWorkers(ns: NS): Promise<PurchaseResult> {
   return result;
 }
 
-class Stats {
-  hacksInProgress: number[] = [];
-  hacksSucceeded = 0;
-  hacksFailed = 0;
-  hackedMoney = 0;
-  hacksDuration = 0;
+class JobTypeStats {
+  inProgressHistory: number[] = [];
+  finished = 0;
+  duration = 0;
+  impact = 0;
 
-  growsInProgress: number[] = [];
-  growsFinished = 0;
-  growAmount = 1.0;
-
-  weakensInProgress: number[] = [];
-  weakensFinished = 0;
-  weakenAmount = 0.0;
-
-  workers: number[] = [];
-
-  time = 0;
-
-  targetSecurityLevel: number;
-  jobRegistry: JobRegistry;
-
-  moneyRatios: number[] = [];
-  securityLevels: number[] = [];
-
-  constructor(targetSecurityLevel: number, jobRegistry: JobRegistry) {
-    this.targetSecurityLevel = targetSecurityLevel;
-    this.jobRegistry = jobRegistry;
+  reset() {
+    this.inProgressHistory = [];
+    this.finished = 0;
+    this.duration = 0;
+    this.impact = 0;
   }
+}
+
+class Stats {
+  private hacks = new JobTypeStats();
+  private grows = new JobTypeStats();
+  private weakens = new JobTypeStats();
+
+  private hackCapacityHistory: number[] = [];
+  private moneyRatioHistory: number[] = [];
+  private securityLevelHistory: number[] = [];
+
+  private time = 0;
+
+  constructor(private targetSecurityLevel: number, private executor: Executor) {}
 
   async tick(ns: NS): Promise<void> {
     this.recordServerState(ns);
-    this.recordJobRegistryState();
+    this.recordExecutorState(ns);
     this.time += CONFIG.tickLength;
     if (this.time >= CONFIG.statsPeriod) {
       this.print(ns);
@@ -354,117 +156,109 @@ class Stats {
 
   private recordServerState(ns: NS) {
     const server = CONFIG.target;
-    this.moneyRatios.push(ns.getServerMoneyAvailable(server) / ns.getServerMaxMoney(server));
-    this.securityLevels.push(ns.getServerSecurityLevel(server));
+    this.moneyRatioHistory.push(ns.getServerMoneyAvailable(server) / ns.getServerMaxMoney(server));
+    this.securityLevelHistory.push(ns.getServerSecurityLevel(server));
   }
 
-  private recordJobRegistryState() {
-    this.growsInProgress.push(this.jobRegistry.countByType(MT.GrowRequest));
-    this.hacksInProgress.push(this.jobRegistry.countByType(MT.HackRequest));
-    this.weakensInProgress.push(this.jobRegistry.countByType(MT.WeakenRequest));
-    this.workers.push(this.jobRegistry.getWorkerCount());
+  private recordExecutorState(ns: NS) {
+    this.grows.inProgressHistory.push(this.executor.countThreadsByType(JobType.Grow));
+    this.hacks.inProgressHistory.push(this.executor.countThreadsByType(JobType.Hack));
+    this.weakens.inProgressHistory.push(this.executor.countThreadsByType(JobType.Weaken));
+    this.hackCapacityHistory.push(this.executor.getMaximumThreads(ns, JobType.Hack));
   }
 
   private reset() {
-    this.hacksSucceeded = 0;
-    this.hacksFailed = 0;
-    this.hackedMoney = 0;
-    this.hacksDuration = 0;
-    this.growsFinished = 0;
-    this.growAmount = 1.0;
-    this.weakensFinished = 0;
-    this.weakenAmount = 0.0;
+    this.hacks.reset();
+    this.grows.reset();
+    this.weakens.reset();
     this.time = 0;
-    this.moneyRatios = [];
-    this.securityLevels = [];
-    this.hacksInProgress = [];
-    this.growsInProgress = [];
-    this.weakensInProgress = [];
-    this.workers = [];
+    this.moneyRatioHistory = [];
+    this.securityLevelHistory = [];
+    this.hackCapacityHistory = [];
   }
 
-  handleMessage(ns: NS, message: Message): void {
-    if (message.type === MT.HackFinished) {
-      if (message.success) {
-        this.hacksSucceeded += 1;
-        this.hackedMoney += message.amount;
-        this.hacksDuration += message.duration;
-      } else {
-        this.hacksFailed += 1;
+  handleResults(results: Result[]): void {
+    for (const result of results) {
+      if (result.type === JobType.Hack) {
+        this.hacks.finished += result.threads;
+        this.hacks.duration += result.duration;
+        this.hacks.impact += result.impact;
+      } else if (result.type === JobType.Grow) {
+        this.grows.finished += result.threads;
+        this.grows.duration += result.duration;
+        this.grows.impact *= result.impact;
+      } else if (result.type === JobType.Weaken) {
+        this.weakens.finished += result.threads;
+        this.weakens.duration += result.duration;
+        this.weakens.impact += result.impact;
       }
-    }
-
-    if (message.type === MT.GrowFinished) {
-      this.growsFinished += 1;
-      this.growAmount *= message.amount;
-    }
-
-    if (message.type == MT.WeakenFinished) {
-      this.weakensFinished += 1;
-      this.weakenAmount += message.amount;
     }
   }
 
   private formatInProgress(history: number[]): string {
     const sum = history.reduce((a, b) => a + b, 0);
-    const avg = sum / history.length;
-    return `(min=${Math.min(...history)} max=${Math.max(...history)} avg=${Math.round(avg)})`;
+    const avg = Math.round(sum / history.length);
+    return `${Math.min(...history)},${avg},${Math.max(...history)}`;
   }
 
   print(ns: NS): void {
     ns.print(`== Stats after ${fmt.time(ns, this.time)} target:${CONFIG.target} ==`);
-    ns.print(
-      `[money-ratio] min=${fmt.float(ns, Math.min(...this.moneyRatios))} max=${ns.nFormat(
-        Math.max(...this.moneyRatios),
-        Formats.float,
-      )} avg=${ns.nFormat(
-        this.moneyRatios.reduce((a, b) => a + b, 0) / this.moneyRatios.length,
-        Formats.float,
-      )} target=${ns.nFormat(CONFIG.targetMoneyRatio, Formats.float)}`,
-    );
-    ns.print(
-      `[   security] min=${ns.nFormat(Math.min(...this.securityLevels), Formats.float)} max=${ns.nFormat(
-        Math.max(...this.securityLevels),
-        Formats.float,
-      )} avg=${ns.nFormat(
-        this.securityLevels.reduce((a, b) => a + b, 0) / this.securityLevels.length,
-        Formats.float,
-      )} target=${ns.nFormat(this.targetSecurityLevel, Formats.float)}`,
-    );
+
     const utilization = [];
-    for (let i = 0; i < this.workers.length; i += 1) {
+    for (let i = 0; i < this.hackCapacityHistory.length; i += 1) {
       utilization.push(
-        (this.hacksInProgress[i] + this.weakensInProgress[i] + this.growsInProgress[i]) / this.workers[i],
+        (this.hacks.inProgressHistory[i] +
+          this.executor.equivalentThreads(ns, this.weakens.inProgressHistory[i], JobType.Weaken, JobType.Hack) +
+          this.executor.equivalentThreads(ns, this.grows.inProgressHistory[i], JobType.Grow, JobType.Hack)) /
+          this.hackCapacityHistory[i],
       );
     }
-    ns.print(
-      `[utilization] min=${fmt.float(ns, Math.min(...utilization))} max=${fmt.float(
-        ns,
-        Math.max(...utilization),
-      )} avg=${fmt.float(ns, utilization.reduce((a, b) => a + b, 0) / utilization.length)}`,
+
+    const lines = fmt.logKeyValueTabulated(
+      [
+        'money-ratio',
+        ['min', fmt.float(ns, Math.min(...this.moneyRatioHistory))],
+        ['max', fmt.float(ns, Math.max(...this.moneyRatioHistory))],
+        ['avg', fmt.float(ns, this.moneyRatioHistory.reduce((a, b) => a + b, 0) / this.moneyRatioHistory.length)],
+        ['target', fmt.float(ns, CONFIG.targetMoneyRatio)],
+      ],
+      [
+        'security',
+        ['min', fmt.float(ns, Math.min(...this.securityLevelHistory))],
+        ['max', fmt.float(ns, Math.max(...this.securityLevelHistory))],
+        ['avg', fmt.float(ns, this.securityLevelHistory.reduce((a, b) => a + b, 0) / this.securityLevelHistory.length)],
+        ['target', fmt.float(ns, this.targetSecurityLevel)],
+      ],
+      [
+        'utilization',
+        ['min', fmt.float(ns, Math.min(...utilization))],
+        ['max', fmt.float(ns, Math.max(...utilization))],
+        ['avg', fmt.float(ns, utilization.reduce((a, b) => a + b, 0) / utilization.length)],
+        ['maxHackThreads', this.executor.getMaximumThreads(ns, JobType.Hack).toString()],
+      ],
+      [
+        'hacks',
+        ['proc', this.formatInProgress(this.hacks.inProgressHistory)],
+        ['done', this.hacks.finished.toString()],
+        ['money', fmt.money(ns, this.hacks.impact)],
+        ['per-sec', fmt.money(ns, this.hacks.impact / (this.time / 1000))],
+      ],
+      [
+        'grows',
+        ['proc', this.formatInProgress(this.grows.inProgressHistory)],
+        ['done', this.grows.finished.toString()],
+        ['amount', fmt.float(ns, this.grows.impact)],
+      ],
+      [
+        'weakens',
+        ['proc', this.formatInProgress(this.weakens.inProgressHistory)],
+        ['done', this.weakens.finished.toString()],
+        ['amount', fmt.float(ns, this.weakens.impact)],
+      ],
     );
-    ns.print(
-      `[      hacks] proc=${this.formatInProgress(this.hacksInProgress)} pass=${this.hacksSucceeded} fail=${
-        this.hacksFailed
-      } money=${ns.nFormat(this.hackedMoney, Formats.money)} per-sec=${ns.nFormat(
-        this.hackedMoney / (this.hacksSucceeded * (this.hacksDuration / 1000)),
-        Formats.money,
-      )} avg=${ns.nFormat(this.hackedMoney / (this.hacksSucceeded + this.hacksFailed), Formats.money)}`,
-    );
-    ns.print(
-      `[      grows] proc=${this.formatInProgress(this.growsInProgress)} done=${this.growsFinished} amount=${ns.nFormat(
-        this.growAmount,
-        Formats.float,
-      )} avg=${ns.nFormat(this.growAmount / this.growsFinished, Formats.float)}`,
-    );
-    ns.print(
-      `[    weakens] proc=${this.formatInProgress(this.weakensInProgress)} done=${
-        this.weakensFinished
-      } amount=${ns.nFormat(this.weakenAmount, Formats.float)} per-sec=${ns.nFormat(
-        this.weakenAmount / CONFIG.statsPeriod,
-        Formats.float,
-      )} avg=${ns.nFormat(this.weakenAmount / this.weakensFinished, Formats.float)}`,
-    );
+    for (const line of lines) {
+      ns.print(line);
+    }
   }
 }
 
@@ -472,36 +266,19 @@ export async function main(ns: NS): Promise<void> {
   ns.disableLog('ALL');
   loadConfig(ns);
 
-  ns.clearPort(Port.AutohackCommand);
-  ns.clearPort(Port.AutohackResponse);
-
   const action = ns.args[0];
-  if (action === 'deploy-workers') {
-    await deployAllWorkers(ns, new Pool());
-  } else if (action === 'kill-workers') {
+  if (action === 'kill-workers') {
     await killWorkers(ns);
   } else if (action === 'hack') {
-    await killWorkers(ns);
-
-    const workerPool = new Pool();
-    await deployAllWorkers(ns, workerPool);
-    const jobRegistry = new JobRegistry(workerPool);
+    const executor = new Executor();
+    await executor.update(ns);
+    const splayed = new Splayed(executor);
 
     const targetSecurityLevel = ns.getServerMinSecurityLevel(CONFIG.target);
 
-    const stats = new Stats(targetSecurityLevel, jobRegistry);
+    const stats = new Stats(targetSecurityLevel, executor);
     await stats.tick(ns);
-
-    const drainInbox = async (): Promise<void> => {
-      while (true) {
-        const message = await readMessage(ns, Port.AutohackResponse);
-        if (message === null) {
-          break;
-        }
-        jobRegistry.handleMessage(ns, message);
-        stats.handleMessage(ns, message);
-      }
-    };
+    stats.print(ns);
 
     while (true) {
       loadConfig(ns);
@@ -529,16 +306,9 @@ export async function main(ns: NS): Promise<void> {
         : 0;
 
       // Get more / better servers
-      const { deleted, purchased } = await purchaseWorkers(ns);
-      for (const s of deleted) {
-        workerPool.delete(s);
-        jobRegistry.hostKilled(s);
-      }
-      for (const s of purchased) {
-        await scp(ns, s);
-        const newWorkerCount = await startWorkers(ns, s);
-        workerPool.setWorkerCount(s, newWorkerCount);
-      }
+      await purchaseWorkers(ns);
+      // TODO update stats about finished jobs somehow
+      stats.handleResults(await executor.update(ns));
 
       // Ideal number of hacks
       const moneyPerHack =
@@ -553,7 +323,7 @@ export async function main(ns: NS): Promise<void> {
 
       // Compute the amount of growth we need to support ideal number of hacks
       const moneyAfterHacks =
-        ns.getServerMoneyAvailable(CONFIG.target) - moneyPerHack * jobRegistry.count(CONFIG.target, MT.HackRequest);
+        ns.getServerMoneyAvailable(CONFIG.target) - moneyPerHack * executor.countThreads(CONFIG.target, JobType.Hack);
       let wantGrow: number;
       if (moneyRatio < 1) {
         const wantedMultiplier = ns.getServerMaxMoney(CONFIG.target) / moneyAfterHacks;
@@ -563,8 +333,8 @@ export async function main(ns: NS): Promise<void> {
       }
 
       // Compute the amount of weaken we need
-      const growSecurityCost = ns.growthAnalyzeSecurity(jobRegistry.count(CONFIG.target, MT.GrowRequest));
-      const hackSecurityCost = ns.hackAnalyzeSecurity(jobRegistry.count(CONFIG.target, MT.HackRequest));
+      const growSecurityCost = ns.growthAnalyzeSecurity(executor.countThreads(CONFIG.target, JobType.Grow));
+      const hackSecurityCost = ns.hackAnalyzeSecurity(executor.countThreads(CONFIG.target, JobType.Hack));
       const securityCost = growSecurityCost + hackSecurityCost;
       const wantedSecurityDecrease = ns.getServerSecurityLevel(CONFIG.target) + securityCost - targetSecurityLevel;
       let wantWeaken: number;
@@ -576,31 +346,39 @@ export async function main(ns: NS): Promise<void> {
       }
 
       // Limit hack load to grow load
-      const haveGrow = jobRegistry.count(CONFIG.target, MT.GrowRequest);
+      const haveGrow = executor.countThreads(CONFIG.target, JobType.Grow);
       const finalHacks = Math.round(wantHack * Math.min(1, wantGrow ? haveGrow / wantGrow : 1));
       /*
       ns.tprint(
-        `want=${wantHack} wantGrow=${wantGrow} haveGrow=${jobRegistry.count(
+        `want=${wantHack} wantGrow=${wantGrow} haveGrow=${executor.countThreads(
           CONFIG.target,
-          MT.GrowRequest,
+          JobType.Grow,
         )} finalHack=${finalHacks}`,
       );
       */
       // Schedule hacks
       if (finalHacks > 0) {
         //ns.tprint(`${maxHackJobs} ${hacksWanted} ${moneyPerHack} ${targetAmount}`);
-        await jobRegistry.want(ns, drainInbox, {
+        await splayed.exec(ns, {
           count: wantHack,
           length: hackTime,
           splay,
-          type: MT.HackRequest,
+          type: JobType.Hack,
           target: CONFIG.target,
         });
       }
 
       // Let weaken and grow jobs take up all capacity not reserved for hack jobs
-      let finalWeaken = Math.ceil((workerPool.getWorkerCount() - maxHackJobs) * (wantWeaken / (wantWeaken + wantGrow)));
-      let finalGrow = Math.ceil((workerPool.getWorkerCount() - maxHackJobs) * (wantGrow / (wantWeaken + wantGrow)));
+      const maxWeakenAndGrowThreads =
+        executor.getMaximumThreads(ns, JobType.Weaken) + executor.getMaximumThreads(ns, JobType.Grow);
+      let finalWeaken = Math.floor(
+        (maxWeakenAndGrowThreads - executor.equivalentThreads(ns, maxHackJobs, JobType.Hack, JobType.Weaken)) *
+          (wantWeaken / (wantWeaken + wantGrow)),
+      );
+      let finalGrow = Math.floor(
+        (maxWeakenAndGrowThreads - executor.equivalentThreads(ns, maxHackJobs, JobType.Hack, JobType.Grow)) *
+          (wantGrow / (wantWeaken + wantGrow)),
+      );
 
       // Make super sure we have enough weaken jobs, even after we'll have scheduled all these planned grow jobs
       // Not the most elegant solution, but I don't fully trust my formulas, and this is foolproof.
@@ -609,36 +387,34 @@ export async function main(ns: NS): Promise<void> {
         ns.weakenAnalyze(finalWeaken) <
           ns.getServerSecurityLevel(CONFIG.target) +
             hackSecurityCost +
-            ns.growthAnalyzeSecurity(Math.max(jobRegistry.count(CONFIG.target, MT.GrowRequest) + finalGrow))
+            ns.growthAnalyzeSecurity(Math.max(executor.countThreads(CONFIG.target, JobType.Grow) + finalGrow))
       ) {
         finalWeaken += 1;
         finalGrow -= 1;
       }
 
       if (finalWeaken > 0) {
-        await jobRegistry.want(ns, drainInbox, {
+        await splayed.exec(ns, {
           count: finalWeaken,
           length: weakenTime,
           splay,
-          type: MT.WeakenRequest,
+          type: JobType.Weaken,
           target: CONFIG.target,
         });
       }
 
       if (finalGrow > 0) {
-        await jobRegistry.want(ns, drainInbox, {
+        await splayed.exec(ns, {
           count: finalGrow,
           length: growTime,
           splay,
-          type: MT.GrowRequest,
+          type: JobType.Grow,
           target: CONFIG.target,
         });
       }
 
-      while (new Date().getTime() < tickEnd) {
-        await drainInbox();
-        await ns.asleep(50);
-      }
+      await ns.asleep(tickEnd - new Date().getTime());
+      stats.handleResults(await executor.update(ns));
       await stats.tick(ns);
     }
   }

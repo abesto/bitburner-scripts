@@ -1,0 +1,12 @@
+logging
+  key-value with prefix
+  tabulate schemaless
+  tabulate
+auto-grow servers
+auto-advance to next server (under 2 mins full grow time)
+autonuke from autohack and deploy workers
+config: toggle debug messages (maybe individually)
+config: parse nice duration, money strings
+config: don't explode if it's invalid, print and ignore
+add worker count to stats output
+lower tick rate to below 1s. at last try this led to 0 hack jobs, so we have some hidden dependencies on the tick rate
