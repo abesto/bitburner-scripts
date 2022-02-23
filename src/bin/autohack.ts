@@ -57,7 +57,9 @@ async function startWorkers(ns: NS, hostname: string): Promise<number> {
 
   for (let i = 0; i < workerCount; i++) {
     // Yield before each exec to work around https://github.com/danielyxie/bitburner/issues/1714
-    await ns.asleep(0);
+    if (i < 5) {
+      await ns.asleep(0);
+    }
     await ns.exec(CONFIG.workerScript, hostname, 1, `${i}`);
   }
 
