@@ -38,15 +38,13 @@ async function deployWorkers(ns: NS, hostname: string): Promise<number> {
   return workerCount;
 }
 
-async function deployAllWorkers(ns: NS): Promise<number> {
+async function deployAllWorkers(ns: NS, pool: Pool): Promise<void> {
   const hosts = discoverHackedHosts(ns);
-  let sum = 0;
   for (const hostname of hosts) {
-    sum += await deployWorkers(ns, hostname);
+    pool.setWorkerCount(hostname, await deployWorkers(ns, hostname));
     await ns.sleep(0);
   }
-  ns.print(`Deployed ${sum} workers`);
-  return sum;
+  ns.print(`Deployed ${pool.getWorkerCount()} workers`);
 }
 
 async function killWorkersOnHost(ns: NS, host: string): Promise<number> {
@@ -81,7 +79,7 @@ interface JobRequest {
   type: JobType;
   count: number;
   length: number; // ms
-  splayOver: number; // ms
+  splay: boolean;
 }
 
 class JobRegistry {
@@ -100,30 +98,48 @@ class JobRegistry {
     return [...this.jobs.values()].filter(job => job.type === type).length;
   }
 
-  getWorkerCount(): number {
-    return this.pool.workers;
+  countAll(): number {
+    return [...this.jobs.values()].length;
   }
 
-  async want(ns: NS, req: JobRequest): Promise<number> {
+  getWorkerCount(): number {
+    return this.pool.getWorkerCount();
+  }
+
+  hostKilled(host: string): void {
+    for (const worker of this.jobs.keys()) {
+      if (worker.startsWith(`${host}:`)) {
+        this.jobs.delete(worker);
+      }
+    }
+  }
+
+  async want(ns: NS, drainInbox: () => Promise<void>, req: JobRequest): Promise<number> {
     const existing = this.count(req.target, req.type);
     const toMax = req.count - existing;
-    const splayed = Math.round(req.count / (req.splayOver / TICK_LENGTH));
-    const want = Math.min(toMax, splayed);
-    if (want > 0) {
-      return await this.pool.submit(ns, want, length, { type: req.type, target: req.target });
+    const splayed = req.splay ? Math.round(req.count / (req.length / TICK_LENGTH)) : Number.POSITIVE_INFINITY;
+    const available = this.pool.getWorkerCount() * 0.9 - this.countAll();
+    const want = Math.min(toMax, splayed, available);
+    if (req.type === MT.HackRequest) {
+      //ns.tprint(`${want} ${toMax} ${splayed} ${available} ${existing}`);
     }
-    return 0;
+    if (want > 0) {
+      await this.pool.submit(ns, want, length, { type: req.type, target: req.target }, drainInbox);
+    }
+    return want;
   }
 
   recordJobStarted(ns: NS, workerHost: string, workerIndex: number, type: JobType, target: string): void {
     const worker = `${workerHost}:${workerIndex}`;
+    /*
     if (this.jobs.has(worker)) {
       ns.print(
-        `${workerHost}:${workerIndex} reports it started hacking ${target}, but we already have a job for it: ${JSON.stringify(
+        `${workerHost}:${workerIndex} reports it started ${type} against ${target}, but we already have a job for it: ${JSON.stringify(
           this.jobs.get(worker),
         )}. Dropping the old job from the registry.`,
       );
     }
+    */
     this.jobs.set(worker, { type, target });
   }
 
@@ -131,17 +147,19 @@ class JobRegistry {
     const worker = `${workerHost}:${workerIndex}`;
     const job = this.jobs.get(worker);
     if (job === undefined) {
-      ns.print(`${workerHost}:${workerIndex} reports it finished a ${type}, but we don't have a job for it.`);
+      //ns.print(`${workerHost}:${workerIndex} reports it finished a ${type}, but we don't have a job for it.`);
       return;
     }
+    /*
     if (job.type !== type) {
       ns.print(`${workerHost}:${workerIndex} reports it finished a ${type}, but we have a ${job.type} job for it.`);
     }
     if (job.target !== target) {
       ns.print(
-        `${workerHost}:${workerIndex} reports it finished hacking ${target}, but we have a ${job.target} job for it.`,
+        `${workerHost}:${workerIndex} reports it finished ${type} against ${target}, but we have a ${job.target} job for it.`,
       );
     }
+    */
     this.jobs.delete(worker);
   }
 
@@ -179,38 +197,40 @@ class JobRegistry {
 }
 
 class Pool {
-  workers: number;
-  ends: number[] = [];
+  private workers: { [hostname: string]: number } = {};
 
-  constructor(workers: number) {
-    this.workers = workers;
+  setWorkerCount(hostname: string, count: number): void {
+    this.workers[hostname] = count;
   }
 
-  prune() {
-    const now = new Date().getTime();
-    while (this.ends.length > 0 && this.ends[0] < now) {
-      this.ends.shift();
-    }
+  getWorkerCount(): number {
+    return Object.values(this.workers).reduce((a, b) => a + b, 0);
   }
 
-  async submit(ns: NS, count: number | null, length: number, message: Message): Promise<number> {
-    this.prune();
-    const available = this.workers - this.ends.length;
-    const booked = Math.min(available, count || available);
-    const end = new Date().getTime() + length;
-    for (let i = 0; i < booked; i++) {
-      this.ends.push(end);
-      let popped = await writeMessage(ns, Port.AutohackCommand, message);
-      while (popped) {
-        await ns.sleep(100);
-        popped = await writeMessage(ns, Port.AutohackCommand, popped);
+  delete(hostname: string): void {
+    delete this.workers[hostname];
+  }
+
+  async submit(
+    ns: NS,
+    count: number,
+    length: number,
+    message: Message,
+    drainInbox: () => Promise<void>,
+  ): Promise<void> {
+    for (let i = 0; i < count; i++) {
+      // Ignore if the queue is full, drop items from it. Better than blocking further work.
+      await writeMessage(ns, Port.AutohackCommand, message);
+      // Stop regularly to read our input port
+      if (i % 5 === 0) {
+        await drainInbox();
+        await ns.sleep(0);
       }
     }
-    return booked;
   }
 }
 
-async function deleteWeakestWorker(ns: NS, keep: number): Promise<boolean> {
+async function deleteWeakestWorker(ns: NS, keep: number): Promise<string | null> {
   const server = ns
     .getPurchasedServers()
     .filter(h => h.startsWith('worker-'))
@@ -222,38 +242,45 @@ async function deleteWeakestWorker(ns: NS, keep: number): Promise<boolean> {
     });
   if (ns.getServerMaxRam(server) >= keep) {
     //ns.print(`Not deleting weakest worker, it's too big: ${server} (${ns.getServerMaxRam(server)}GB > ${keep}GB)`);
-    return false;
+    return null;
   }
   ns.print(`Deleting weakest server: ${server} (${ns.getServerMaxRam(server)}GB)`);
   await killWorkersOnHost(ns, server);
   if (!ns.deleteServer(server)) {
     throw new Error(`Failed to delete server ${server}`);
   }
-  return true;
+  return server;
 }
 
-async function purchaseWorkers(ns: NS): Promise<string[]> {
+interface PurchaseResult {
+  deleted: string[];
+  purchased: string[];
+}
+
+async function purchaseWorkers(ns: NS): Promise<PurchaseResult> {
   const ram = parseInt(ns.read('/autohack/purchase-ram.txt' || '64'));
   const cost = ns.getPurchasedServerCost(ram);
-  const workers = [];
+  const result: PurchaseResult = { deleted: [], purchased: [] };
 
   const reservedMoney = parseInt(ns.read('/autohack/reserved-money.txt') || '0');
   while (ns.getPlayer().money - cost > reservedMoney) {
     if (ns.getPurchasedServerLimit() <= ns.getPurchasedServers().length) {
-      if (!(await deleteWeakestWorker(ns, ram))) {
+      const deleted = await deleteWeakestWorker(ns, ram);
+      if (deleted === null) {
         break;
       }
+      result.deleted.push(deleted);
     }
     let index = 0;
     while (ns.serverExists(`worker-${index}`)) {
       index += 1;
     }
     const hostname = ns.purchaseServer(`worker-${index}`, ram);
-    workers.push(hostname);
+    result.purchased.push(hostname);
     ns.print(`Purchased ${hostname} with ${ram}GB RAM`);
   }
 
-  return workers;
+  return result;
 }
 
 class Stats {
@@ -432,19 +459,18 @@ export async function main(ns: NS): Promise<void> {
 
   const action = ns.args[0];
   if (action === 'deploy-workers') {
-    await deployAllWorkers(ns);
+    await deployAllWorkers(ns, new Pool());
   } else if (action === 'kill-workers') {
     await killWorkers(ns);
   } else if (action === 'hack') {
     await killWorkers(ns);
     const hostname = ns.args[1] as string;
-    const workerCount = await deployAllWorkers(ns);
 
-    const workerPool = new Pool(workerCount);
+    const workerPool = new Pool();
+    await deployAllWorkers(ns, workerPool);
     const jobRegistry = new JobRegistry(workerPool);
 
-    //const targetMoneyRatio = ns.getServerMoneyAvailable(hostname) / ns.getServerMaxMoney(hostname);
-    const targetMoneyRatio = 0.9;
+    let targetMoneyRatio = parseFloat(ns.read('/autohack/target-money-ratio.txt') || '0.9');
     const targetSecurityLevel = ns.getServerMinSecurityLevel(hostname);
 
     const stats = new Stats(
@@ -456,42 +482,72 @@ export async function main(ns: NS): Promise<void> {
     );
     await stats.tick(ns);
 
+    const drainInbox = async (): Promise<void> => {
+      while (true) {
+        const message = await readMessage(ns, Port.AutohackResponse);
+        if (message === null) {
+          break;
+        }
+        jobRegistry.handleMessage(ns, message);
+        stats.handleMessage(ns, message);
+      }
+    };
+
     while (true) {
+      const tickEnd = new Date().getTime() + TICK_LENGTH;
+      targetMoneyRatio = parseFloat(ns.read('/autohack/target-money-ratio.txt') || '0.9');
+      stats.targetMoneyRatio = targetMoneyRatio;
+
+      // Some commonly used numbers
       const growTime = ns.getGrowTime(hostname);
       const hackTime = ns.getHackTime(hostname);
       const weakenTime = ns.getWeakenTime(hostname);
-      const maxHackJobs = Math.ceil(
-        (ns.getServerMaxMoney(hostname) * (1 - targetMoneyRatio)) /
-          (ns.getServerMaxMoney(hostname) * ns.hackAnalyze(hostname) * ns.hackAnalyzeChance(hostname)),
-      );
       const moneyRatio = ns.getServerMoneyAvailable(hostname) / ns.getServerMaxMoney(hostname);
-      const splayOver = Math.max(growTime, hackTime, weakenTime);
 
-      const tickEnd = new Date().getTime() + TICK_LENGTH;
+      // Splay jobs to establish a steady stream of changes, which makes it easier for the orchestrator to react to
+      // changes. EXCEPT if we're in the (initial) phase of super-low available money, in which case we'll just throw
+      // everything at it, and disable hacks.
+      const splay = moneyRatio >= targetMoneyRatio * 0.75;
 
-      for (const newServer of await purchaseWorkers(ns)) {
-        const newWorkerCount = await deployWorkers(ns, newServer);
-        workerPool.workers += newWorkerCount;
+      // We'll reserve workers for this many hack jobs
+      const maxHackJobs = splay
+        ? Math.ceil(
+            Math.min(
+              workerPool.getWorkerCount() * 0.3,
+              (ns.getServerMaxMoney(hostname) * (1 - targetMoneyRatio)) /
+                (ns.getServerMaxMoney(hostname) * ns.hackAnalyze(hostname) * ns.hackAnalyzeChance(hostname)),
+            ),
+          )
+        : 0;
+
+      // Get more / better servers
+      const { deleted, purchased } = await purchaseWorkers(ns);
+      for (const s of deleted) {
+        workerPool.delete(s);
+        jobRegistry.hostKilled(s);
+      }
+      for (const s of purchased) {
+        const newWorkerCount = await deployWorkers(ns, s);
+        workerPool.setWorkerCount(s, newWorkerCount);
       }
 
+      // Schedule hacks
       const moneyPerHack =
         ns.getServerMoneyAvailable(hostname) * ns.hackAnalyze(hostname) * ns.hackAnalyzeChance(hostname);
       if (moneyRatio >= targetMoneyRatio) {
         const targetAmount = ns.getServerMaxMoney(hostname) * (moneyRatio - targetMoneyRatio);
-        const hacksWanted = Math.ceil(targetAmount / moneyPerHack);
-
-        const hacksScheduled = await jobRegistry.want(ns, {
+        const hacksWanted = Math.min(maxHackJobs, Math.ceil(targetAmount / moneyPerHack));
+        //ns.tprint(`${maxHackJobs} ${hacksWanted} ${moneyPerHack} ${targetAmount}`);
+        await jobRegistry.want(ns, drainInbox, {
           count: hacksWanted,
           length: hackTime,
-          splayOver,
+          splay,
           type: MT.HackRequest,
           target: hostname,
         });
-        if (hacksScheduled > 0) {
-          //ns.print(`[scheduled] ${hacksScheduled}/${hacksWanted} hack jobs against ${hostname} (time: ${ns.tFormat(hackTime)})`);
-        }
       }
 
+      // Compute the amount of growth we need
       const moneyAfterHacks =
         ns.getServerMoneyAvailable(hostname) - moneyPerHack * jobRegistry.count(hostname, MT.HackRequest);
       let wantGrow: number;
@@ -502,58 +558,58 @@ export async function main(ns: NS): Promise<void> {
         wantGrow = 0;
       }
 
+      // Compute the amount of weaken we need
       const growSecurityCost = ns.growthAnalyzeSecurity(jobRegistry.count(hostname, MT.GrowRequest));
       const hackSecurityCost = ns.hackAnalyzeSecurity(jobRegistry.count(hostname, MT.HackRequest));
       const securityCost = growSecurityCost + hackSecurityCost;
+      const wantedSecurityDecrease = ns.getServerSecurityLevel(hostname) + securityCost - targetSecurityLevel;
       let wantWeaken: number;
-      if (targetSecurityLevel < ns.getServerSecurityLevel(hostname) + securityCost) {
+      if (wantedSecurityDecrease > 0) {
         const weakenImpact = ns.weakenAnalyze(1, 1);
-        wantWeaken = Math.ceil(
-          (ns.getServerSecurityLevel(hostname) + securityCost - targetSecurityLevel) / weakenImpact,
-        );
+        wantWeaken = Math.ceil(wantedSecurityDecrease / weakenImpact);
       } else {
         wantWeaken = 0;
       }
 
-      const finalWeaken = Math.ceil((workerPool.workers - maxHackJobs) * (wantWeaken / (wantWeaken + wantGrow)));
+      // Let weaken and grow jobs take up all capacity not reserved for hack jobs
+      let finalWeaken = Math.ceil((workerPool.getWorkerCount() - maxHackJobs) * (wantWeaken / (wantWeaken + wantGrow)));
+      let finalGrow = Math.ceil((workerPool.getWorkerCount() - maxHackJobs) * (wantGrow / (wantWeaken + wantGrow)));
+
+      // Make super sure we have enough weaken jobs, even after we'll have scheduled all these planned grow jobs
+      // Not the most elegant solution, but I don't fully trust my formulas, and this is foolproof.
+      while (
+        finalGrow > 0 &&
+        ns.weakenAnalyze(finalWeaken) <
+          ns.getServerSecurityLevel(hostname) +
+            hackSecurityCost +
+            ns.growthAnalyzeSecurity(Math.max(jobRegistry.count(hostname, MT.GrowRequest) + finalGrow))
+      ) {
+        finalWeaken += 1;
+        finalGrow -= 1;
+      }
+
       if (finalWeaken > 0) {
-        const newJobCount = await jobRegistry.want(ns, {
+        await jobRegistry.want(ns, drainInbox, {
           count: finalWeaken,
           length: weakenTime,
-          splayOver,
+          splay,
           type: MT.WeakenRequest,
           target: hostname,
         });
-        if (newJobCount > 0) {
-          //ns.print(`[scheduled] ${newJobCount}/${wantedCount} new weaken jobs for ${hostname} (time: ${ns.tFormat(weakenTime)})`);
-          //ns.print(`[security] ${ns.nFormat(ns.getServerSecurityLevel(hostname), Formats.float)} (target = ${targetSecurityLevel})`);
-        }
       }
 
-      const finalGrow = Math.ceil((workerPool.workers - maxHackJobs) * (wantGrow / (wantWeaken + wantGrow)));
       if (finalGrow > 0) {
-        const newJobCount = await jobRegistry.want(ns, {
+        await jobRegistry.want(ns, drainInbox, {
           count: finalGrow,
           length: growTime,
-          splayOver,
+          splay,
           type: MT.GrowRequest,
           target: hostname,
         });
-        if (newJobCount > 0) {
-          //ns.print(`[scheduled] ${newJobCount}/${wantedCount} new growth jobs for ${hostname} (time: ${ns.tFormat(growTime)})`);
-          //ns.print(`[money-ratio] ${ns.nFormat(moneyRatio, Formats.float)} (target = ${targetMoneyRatio})`);
-        }
       }
 
       while (new Date().getTime() < tickEnd) {
-        while (true) {
-          const message = await readMessage(ns, Port.AutohackResponse);
-          if (message === null) {
-            break;
-          }
-          jobRegistry.handleMessage(ns, message);
-          stats.handleMessage(ns, message);
-        }
+        await drainInbox();
         await ns.sleep(50);
       }
       await stats.tick(ns);

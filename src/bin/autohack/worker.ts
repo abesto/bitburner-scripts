@@ -9,7 +9,7 @@ import {
 import { Port } from 'lib/constants';
 import { timed } from 'lib/time';
 
-const splay = Math.random() * 10;
+const splay = Math.random() * 100;
 
 async function send(ns: NS, messageIn: Message): Promise<void> {
   let message: Message | null = messageIn;
