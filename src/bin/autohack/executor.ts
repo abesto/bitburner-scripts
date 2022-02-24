@@ -167,6 +167,13 @@ class Host {
   }
 
   getMaximumThreads(ns: NS, type: JobType): number {
+    /*
+    ns.tprint(
+      `${this.getName()} usable=${this.maxUsableRam(ns)} type=${type} script=${
+        Scripts[type]
+      } scriptRam=${ns.getScriptRam(Scripts[type], this.getName())}`,
+    );
+    */
     return Math.floor(this.maxUsableRam(ns) / ns.getScriptRam(Scripts[type], this.getName()));
   }
 
@@ -213,13 +220,15 @@ export class Executor {
         }
         const host = new Host(hostname);
         await host.deploy(ns);
+
+        this.hosts = this.hosts.filter(h => h.getName() !== hostname);
         this.hosts.push(host);
         ns.print(`Discovered new host: ${hostname} with ${ns.getServerMaxRam(hostname)}GB RAM, deployed scripts`);
       }
     }
 
     // Find all finished workers
-    // This _should_ handle "gone" hosts correctly (like, when augments are installed)
+    // This _should_ handle "gone" hosts correctly
     const results = [];
     for (const host of this.hosts) {
       results.push(...(await host.update(ns)));
@@ -230,6 +239,10 @@ export class Executor {
 
     // Aaand done
     return results;
+  }
+
+  hostDeleted(hostname: string): void {
+    this.hosts = this.hosts.filter(h => h.getName() !== hostname);
   }
 
   exec(ns: NS, target: string, type: JobType, threads: number): number {

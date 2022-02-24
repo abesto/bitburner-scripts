@@ -306,7 +306,10 @@ export async function main(ns: NS): Promise<void> {
         : 0;
 
       // Get more / better servers
-      await purchaseWorkers(ns);
+      const { deleted } = await purchaseWorkers(ns);
+      for (const server of deleted) {
+        executor.hostDeleted(server);
+      }
       // TODO update stats about finished jobs somehow
       stats.handleResults(await executor.update(ns));
 
