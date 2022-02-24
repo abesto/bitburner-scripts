@@ -7,6 +7,7 @@ import {
   Result,
   scriptDir as executorScriptDir,
 } from 'bin/autohack/executor';
+import { autonuke } from 'lib/autonuke';
 import { discoverHackedHosts } from 'lib/distributed';
 import * as fmt from 'lib/fmt';
 
@@ -92,12 +93,25 @@ interface PurchaseResult {
   purchased: string[];
 }
 
+function biggestAffordableServer(ns: NS, money: number): number {
+  let ram = 8;
+  if (ns.getPurchasedServerCost(ram) > money) {
+    return 0;
+  }
+  while (ns.getPurchasedServerCost(ram ** 2) <= money) {
+    ram = ram ** 2;
+  }
+  return ram;
+}
+
 async function purchaseWorkers(ns: NS): Promise<PurchaseResult> {
-  const ram = CONFIG.purchaseRam;
-  const cost = ns.getPurchasedServerCost(ram);
   const result: PurchaseResult = { deleted: [], purchased: [] };
 
-  while (ns.getPlayer().money - cost > CONFIG.reservedMoney) {
+  while (ns.getPlayer().money > CONFIG.reservedMoney) {
+    const ram = biggestAffordableServer(ns, ns.getPlayer().money - CONFIG.reservedMoney);
+    if (ram === 0) {
+      break;
+    }
     if (ns.getPurchasedServerLimit() <= ns.getPurchasedServers().length) {
       const deleted = await deleteWeakestWorker(ns, ram);
       if (deleted === null) {
@@ -284,6 +298,16 @@ export async function main(ns: NS): Promise<void> {
       loadConfig(ns);
       const tickEnd = new Date().getTime() + CONFIG.tickLength;
 
+      // Get more / better servers
+      const { deleted } = await purchaseWorkers(ns);
+      for (const server of deleted) {
+        executor.hostDeleted(server);
+      }
+      stats.handleResults(await executor.update(ns));
+
+      // Nuke things!
+      autonuke(ns);
+
       // Some commonly used numbers
       const growTime = ns.getGrowTime(CONFIG.target);
       const hackTime = ns.getHackTime(CONFIG.target);
@@ -305,14 +329,6 @@ export async function main(ns: NS): Promise<void> {
           )
         : 0;
 
-      // Get more / better servers
-      const { deleted } = await purchaseWorkers(ns);
-      for (const server of deleted) {
-        executor.hostDeleted(server);
-      }
-      // TODO update stats about finished jobs somehow
-      stats.handleResults(await executor.update(ns));
-
       // Ideal number of hacks
       const moneyPerHack =
         ns.getServerMoneyAvailable(CONFIG.target) * ns.hackAnalyze(CONFIG.target) * ns.hackAnalyzeChance(CONFIG.target);
@@ -329,7 +345,7 @@ export async function main(ns: NS): Promise<void> {
         ns.getServerMoneyAvailable(CONFIG.target) - moneyPerHack * executor.countThreads(CONFIG.target, JobType.Hack);
       let wantGrow: number;
       if (moneyRatio < 1) {
-        const wantedMultiplier = ns.getServerMaxMoney(CONFIG.target) / moneyAfterHacks;
+        const wantedMultiplier = Math.max(1, ns.getServerMaxMoney(CONFIG.target) / moneyAfterHacks);
         wantGrow = Math.ceil(ns.growthAnalyze(CONFIG.target, wantedMultiplier));
       } else {
         wantGrow = 0;

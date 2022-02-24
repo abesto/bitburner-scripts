@@ -38,3 +38,12 @@ export function logKeyValueTabulated(...rows: [string, ...[string, string][]][])
 
   return lines;
 }
+
+export function table(ns: NS, headers: string[], ...rows: string[][]): string[] {
+  const maxColumnLengths = headers.map((header, i) => Math.max(header.length, ...rows.map(row => row[i].length)));
+
+  return [
+    headers.map((header, i) => header.padEnd(maxColumnLengths[i])).join('\t'),
+    ...rows.map(row => row.map((field, i) => field.padEnd(maxColumnLengths[i])).join('\t')),
+  ];
+}
