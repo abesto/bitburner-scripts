@@ -14,7 +14,11 @@ export function time(ns: NS, t: number): string {
   return ns.tFormat(t);
 }
 
-export function logKeyValueTabulated(...rows: [string, ...[string, string][]][]): string[] {
+export function keyValue(...items: [string, string][]): string {
+  return items.map(([key, value]) => `${key}=${value}`).join(' ');
+}
+
+export function keyValueTabulated(...rows: [string, ...[string, string][]][]): string[] {
   const strRows: [string, string[]][] = rows.map(([prefix, ...fields]) => [
     prefix,
     fields.map(([key, value]) => `${key}=${value}`),

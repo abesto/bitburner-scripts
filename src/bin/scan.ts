@@ -9,6 +9,9 @@ function getFullGrowTime(ns: NS, hostname: string, workers: number): number {
   if (!wantedMultiplier) {
     return 0;
   }
+  if (wantedMultiplier === Number.POSITIVE_INFINITY) {
+    return wantedMultiplier;
+  }
   const wantGrow = Math.ceil(ns.growthAnalyze(hostname, wantedMultiplier));
   const time = ns.getGrowTime(hostname) * wantGrow;
   return time / workers;
@@ -28,9 +31,17 @@ export async function main(ns: NS): Promise<void> {
         .map(p => p.threads),
     )
     .reduce((a, b) => a + b, 0);
-  hosts.sort((a, b) => getMaxHackMoneyPerSec(ns, a) - getMaxHackMoneyPerSec(ns, b));
+  hosts.sort((a, b) => ns.getServerMaxMoney(a) - ns.getServerMaxMoney(b));
 
-  const headers = ['Host', 'Full Grow Time', 'Hack Time', 'Grow Time', 'Max Hack Money Per Sec', 'Available Money'];
+  const headers = [
+    'Host',
+    'Full Grow Time',
+    'Hack Time',
+    'Grow Time',
+    'Weaken Time',
+    'Max Hack Money Per Sec',
+    'Available Money',
+  ];
   const rows: string[][] = [];
 
   for (const host of hosts) {
@@ -38,7 +49,7 @@ export async function main(ns: NS): Promise<void> {
       continue;
     }
     if (getFullGrowTime(ns, host, workers) >= 120 * 1000) {
-      continue;
+      //continue;
     }
 
     rows.push([
@@ -46,6 +57,7 @@ export async function main(ns: NS): Promise<void> {
       fmt.time(ns, getFullGrowTime(ns, host, workers)),
       fmt.time(ns, ns.getHackTime(host)),
       fmt.time(ns, ns.getGrowTime(host)),
+      fmt.time(ns, ns.getWeakenTime(host)),
       fmt.money(ns, getMaxHackMoneyPerSec(ns, host)),
       fmt.money(ns, ns.getServerMaxMoney(host)),
     ]);

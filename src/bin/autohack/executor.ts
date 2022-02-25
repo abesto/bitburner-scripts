@@ -21,7 +21,7 @@ export interface Result {
 
 export const scriptDir = '/bin/autohack/executor_scripts';
 
-const Scripts = {
+export const Scripts = {
   [JobType.Hack]: `${scriptDir}/hack.js`,
   [JobType.Grow]: `${scriptDir}/grow.js`,
   [JobType.Weaken]: `${scriptDir}/weaken.js`,
@@ -245,26 +245,32 @@ export class Executor {
     this.hosts = this.hosts.filter(h => h.getName() !== hostname);
   }
 
-  exec(ns: NS, target: string, type: JobType, threads: number): number {
-    // Sort hosts ascending by available threads
-    this.hosts.sort((a, b) => a.getAvailableThreads(ns, type) - b.getAvailableThreads(ns, type));
+  async exec(ns: NS, target: string, type: JobType, threads: number): Promise<number> {
+    this.hosts.sort((a, b) => b.getAvailableThreads(ns, type) - a.getAvailableThreads(ns, type));
 
     let started = 0;
-    for (let i = 0; i < this.hosts.length && started < threads; i++) {
-      const host = this.hosts[i];
+    for (const host of this.hosts) {
       // home has increased effectiveness for Grow and Weaken jobs, reserve it for those
       if (host.getName() === 'home' && type !== JobType.Grow && type !== JobType.Weaken) {
         continue;
       }
+      if (started >= threads) {
+        return started;
+      }
       const available = host.getAvailableThreads(ns, type);
       if (available > 0) {
         const toExec = Math.min(available, threads - started);
+        //ns.print(`Executing ${toExec} ${type} threads on ${host.getName()}`);
         if (host.exec(ns, target, type, toExec)) {
           started += toExec;
+        } else {
+          ns.print(`Failed to start ${toExec} ${type} threads on ${host.getName()}`);
         }
+        await ns.asleep(0);
       }
     }
 
+    ns.print(`Failed to start ${threads} ${type} threads: got only ${started}`);
     return started;
   }
 }
