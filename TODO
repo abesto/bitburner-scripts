@@ -1,4 +1,2 @@
 auto-advance to next server (under 2 mins full grow time)
-config: toggle debug messages (maybe individually)
 config: don't explode if it's invalid, print and ignore
-lower tick rate to below 1s. at last try this led to 0 hack jobs, so we have some hidden dependencies on the tick rate

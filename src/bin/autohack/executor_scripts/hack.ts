@@ -5,7 +5,7 @@ export async function main(ns: NS): Promise<void> {
   const impact = await ns.hack(ns.args[0] as string);
   const duration = Date.now() - start;
   await ns.write(
-    `/autohack/results/${ns.args[1]}.txt`,
+    `/autohack/results/${ns.args[1]}-${ns.args[2]}.txt`,
     JSON.stringify({
       impact,
       duration,

@@ -5,7 +5,7 @@ import {
   MessageType as MT,
   readMessage,
   writeMessage,
-} from 'bin/autohack/messages';
+} from 'lib/autohack/messages';
 import { Port } from 'lib/constants';
 import { timed } from 'lib/time';
 

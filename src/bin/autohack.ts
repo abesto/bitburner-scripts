@@ -1,40 +1,21 @@
+import { Statemachine } from '/lib/autohack/statemachine';
+
 import { NS } from '@ns';
 
-import { CONFIG, loadConfig } from 'bin/autohack/config';
+import { CONFIG, loadConfig } from 'lib/autohack/config';
+import { initDebug } from 'lib/autohack/debug';
 import {
   Executor,
   JobType,
   Result,
   scriptDir as executorScriptDir,
   Scripts as ExecutorScripts,
-} from 'bin/autohack/executor';
+} from 'lib/autohack/executor';
 import { autonuke } from 'lib/autonuke';
 import { discoverHackedHosts } from 'lib/distributed';
 import * as fmt from 'lib/fmt';
-
-async function killWorkersOnHost(ns: NS, host: string, type: JobType | null = null): Promise<number> {
-  let killed = 0;
-  for (const process of ns.ps(host)) {
-    if (type === null && !process.filename.startsWith(executorScriptDir)) {
-      continue;
-    }
-    if (type !== null && process.filename !== ExecutorScripts[type]) {
-      continue;
-    }
-    await ns.kill(process.filename, host, ...process.args);
-    killed += process.threads;
-  }
-  return killed;
-}
-
-async function killWorkers(ns: NS, type: JobType | null = null): Promise<void> {
-  const hosts = discoverHackedHosts(ns);
-  let killed = 0;
-  for (const host of hosts) {
-    killed += await killWorkersOnHost(ns, host, type);
-  }
-  ns.print(`Killed ${killed} workers (type=${type})`);
-}
+import * as formulas from 'lib/formulas';
+import { Scheduler } from 'lib/scheduler';
 
 interface JobRequest {
   target: string;
@@ -65,13 +46,13 @@ class Splayed {
         */
     }
     if (want > 0) {
-      return await this.executor.exec(ns, req.target, req.type, want);
+      return await this.executor.exec(req.target, req.type, want);
     }
     return 0;
   }
 }
 
-async function deleteWeakestWorker(ns: NS, keep: number): Promise<string | null> {
+async function deleteWeakestWorker(ns: NS, executor: Executor, keep: number): Promise<string | null> {
   const server = ns
     .getPurchasedServers()
     .filter(h => h.startsWith('worker-'))
@@ -86,7 +67,7 @@ async function deleteWeakestWorker(ns: NS, keep: number): Promise<string | null>
     return null;
   }
   ns.print(`Deleting weakest server: ${server} (${ns.getServerMaxRam(server)}GB)`);
-  await killWorkersOnHost(ns, server);
+  await executor.killWorkersOnHost(server);
   if (!ns.deleteServer(server)) {
     throw new Error(`Failed to delete server ${server}`);
   }
@@ -109,7 +90,7 @@ function biggestAffordableServer(ns: NS, money: number): number {
   return ram;
 }
 
-async function purchaseWorkers(ns: NS): Promise<PurchaseResult> {
+async function purchaseWorkers(ns: NS, executor: Executor): Promise<PurchaseResult> {
   const result: PurchaseResult = { deleted: [], purchased: [] };
 
   while (ns.getPlayer().money > CONFIG.reservedMoney) {
@@ -118,7 +99,7 @@ async function purchaseWorkers(ns: NS): Promise<PurchaseResult> {
       break;
     }
     if (ns.getPurchasedServerLimit() <= ns.getPurchasedServers().length) {
-      const deleted = await deleteWeakestWorker(ns, ram);
+      const deleted = await deleteWeakestWorker(ns, executor, ram);
       if (deleted === null) {
         break;
       }
@@ -162,31 +143,31 @@ class Stats {
 
   private time = 0;
 
-  constructor(private executor: Executor) {}
+  constructor(private ns: NS, private executor: Executor) {}
 
-  async tick(ns: NS): Promise<boolean> {
-    this.recordServerState(ns);
-    this.recordExecutorState(ns);
+  async tick(): Promise<boolean> {
+    this.recordServerState();
+    this.recordExecutorState();
     this.time += CONFIG.tickLength;
     if (this.time >= CONFIG.statsPeriod) {
-      this.print(ns);
+      this.print();
       this.reset();
       return true;
     }
     return false;
   }
 
-  private recordServerState(ns: NS) {
+  private recordServerState() {
     const server = CONFIG.target;
-    this.moneyRatioHistory.push(ns.getServerMoneyAvailable(server) / ns.getServerMaxMoney(server));
-    this.securityLevelHistory.push(ns.getServerSecurityLevel(server));
+    this.moneyRatioHistory.push(this.ns.getServerMoneyAvailable(server) / this.ns.getServerMaxMoney(server));
+    this.securityLevelHistory.push(this.ns.getServerSecurityLevel(server));
   }
 
-  private recordExecutorState(ns: NS) {
+  private recordExecutorState() {
     this.grows.inProgressHistory.push(this.executor.countThreads(CONFIG.target, JobType.Grow));
     this.hacks.inProgressHistory.push(this.executor.countThreads(CONFIG.target, JobType.Hack));
     this.weakens.inProgressHistory.push(this.executor.countThreads(CONFIG.target, JobType.Weaken));
-    this.hackCapacityHistory.push(this.executor.getMaximumThreads(ns, JobType.Hack));
+    this.hackCapacityHistory.push(this.executor.getMaximumThreads(JobType.Hack));
   }
 
   expected(hacks: number, grows: number, weakens: number) {
@@ -229,15 +210,15 @@ class Stats {
     return `${Math.min(...history)},${avg},${Math.max(...history)}`;
   }
 
-  print(ns: NS): void {
-    ns.print(`== Stats after ${fmt.time(ns, this.time)} target:${CONFIG.target} ==`);
+  print(): void {
+    this.ns.print(`== Stats after ${fmt.time(this.time)} target:${CONFIG.target} ==`);
 
     const utilization = [];
     for (let i = 0; i < this.hackCapacityHistory.length; i += 1) {
       utilization.push(
         (this.hacks.inProgressHistory[i] +
-          this.executor.equivalentThreads(ns, this.weakens.inProgressHistory[i], JobType.Weaken, JobType.Hack) +
-          this.executor.equivalentThreads(ns, this.grows.inProgressHistory[i], JobType.Grow, JobType.Hack)) /
+          this.executor.equivalentThreads(this.weakens.inProgressHistory[i], JobType.Weaken, JobType.Hack) +
+          this.executor.equivalentThreads(this.grows.inProgressHistory[i], JobType.Grow, JobType.Hack)) /
           this.hackCapacityHistory[i],
       );
     }
@@ -245,50 +226,50 @@ class Stats {
     const lines = fmt.keyValueTabulated(
       [
         'money-ratio',
-        ['min', fmt.float(ns, Math.min(...this.moneyRatioHistory))],
-        ['max', fmt.float(ns, Math.max(...this.moneyRatioHistory))],
-        ['avg', fmt.float(ns, this.moneyRatioHistory.reduce((a, b) => a + b, 0) / this.moneyRatioHistory.length)],
-        ['target', fmt.float(ns, CONFIG.targetMoneyRatio)],
+        ['min', fmt.float(Math.min(...this.moneyRatioHistory))],
+        ['max', fmt.float(Math.max(...this.moneyRatioHistory))],
+        ['avg', fmt.float(this.moneyRatioHistory.reduce((a, b) => a + b, 0) / this.moneyRatioHistory.length)],
+        ['target', fmt.float(CONFIG.targetMoneyRatio)],
       ],
       [
         'security',
-        ['min', fmt.float(ns, Math.min(...this.securityLevelHistory))],
-        ['max', fmt.float(ns, Math.max(...this.securityLevelHistory))],
-        ['avg', fmt.float(ns, this.securityLevelHistory.reduce((a, b) => a + b, 0) / this.securityLevelHistory.length)],
-        ['target', fmt.float(ns, ns.getServerMinSecurityLevel(CONFIG.target))],
+        ['min', fmt.float(Math.min(...this.securityLevelHistory))],
+        ['max', fmt.float(Math.max(...this.securityLevelHistory))],
+        ['avg', fmt.float(this.securityLevelHistory.reduce((a, b) => a + b, 0) / this.securityLevelHistory.length)],
+        ['target', fmt.float(this.ns.getServerMinSecurityLevel(CONFIG.target))],
       ],
       [
         'utilization',
-        ['min', fmt.float(ns, Math.min(...utilization))],
-        ['max', fmt.float(ns, Math.max(...utilization))],
-        ['avg', fmt.float(ns, utilization.reduce((a, b) => a + b, 0) / utilization.length)],
-        ['maxHackThreads', this.executor.getMaximumThreads(ns, JobType.Hack).toString()],
+        ['min', fmt.float(Math.min(...utilization))],
+        ['max', fmt.float(Math.max(...utilization))],
+        ['avg', fmt.float(utilization.reduce((a, b) => a + b, 0) / utilization.length)],
+        ['maxHackThreads', this.executor.getMaximumThreads(JobType.Hack).toString()],
       ],
       [
         'hacks',
         ['proc', this.formatInProgress(this.hacks.inProgressHistory)],
         ['expected', this.hacks.expected.toString()],
         ['done', this.hacks.finished.toString()],
-        ['money', fmt.money(ns, this.hacks.impact)],
-        ['per-sec', fmt.money(ns, this.hacks.impact / (this.time / 1000))],
+        ['money', fmt.money(this.hacks.impact)],
+        ['per-sec', fmt.money(this.hacks.impact / (this.time / 1000))],
       ],
       [
         'grows',
         ['proc', this.formatInProgress(this.grows.inProgressHistory)],
         ['expected', this.grows.expected.toString()],
         ['done', this.grows.finished.toString()],
-        ['amount', fmt.float(ns, this.grows.impact)],
+        ['amount', fmt.float(this.grows.impact)],
       ],
       [
         'weakens',
         ['proc', this.formatInProgress(this.weakens.inProgressHistory)],
         ['expected', this.weakens.expected.toString()],
         ['done', this.weakens.finished.toString()],
-        ['amount', fmt.float(ns, this.weakens.impact)],
+        ['amount', fmt.float(this.weakens.impact)],
       ],
     );
     for (const line of lines) {
-      ns.print(line);
+      this.ns.print(line);
     }
   }
 }
@@ -296,172 +277,60 @@ class Stats {
 export async function main(ns: NS): Promise<void> {
   ns.disableLog('ALL');
   loadConfig(ns);
+  initDebug(ns);
+  fmt.init(ns);
+  formulas.init(ns);
 
   const action = ns.args[0];
   if (action === 'kill') {
-    await killWorkers(ns);
+    const executor = new Executor(ns);
+    await executor.killWorkers();
     return;
   }
-  const executor = new Executor();
-  await executor.update(ns);
 
-  const stats = new Stats(executor);
-  await stats.tick(ns);
-  stats.print(ns);
+  // Executor runs hack / grow / weaken jobs across all servers
+  const executor = new Executor(ns);
+  await executor.update();
 
-  const growTime = ns.getGrowTime(CONFIG.target);
-  const hackTime = ns.getHackTime(CONFIG.target);
-  const weakenTime = ns.getWeakenTime(CONFIG.target);
+  // Scheduler provides setTimeout / setInterval functionality
+  const scheduler = new Scheduler(ns);
 
-  while (true) {
+  // Statemachine is the business logic
+  const statemachine = new Statemachine(ns, executor, scheduler);
+
+  // Stats is for reporting
+  const stats = new Stats(ns, executor);
+  await stats.tick();
+  stats.print();
+
+  // Not using setInterval because we want to support CONFIG.tickLength changing at runtime
+  const tick = async () => {
+    stats.handleResults(await executor.update());
+    await stats.tick();
+
     loadConfig(ns);
-    const tickEnd = new Date().getTime() + CONFIG.tickLength;
-    const targetSecurityLevel = ns.getServerMinSecurityLevel(CONFIG.target);
-
-    // Get more / better servers
-    const { deleted } = await purchaseWorkers(ns);
-    for (const server of deleted) {
-      executor.hostDeleted(server);
+    // Get more / better servers if we need them
+    if (executor.countAllThreadsHackEquivalent() > executor.getAvailableThreads(JobType.Hack) * 0.8) {
+      const { deleted } = await purchaseWorkers(ns, executor);
+      for (const server of deleted) {
+        executor.hostDeleted(server);
+      }
+      stats.handleResults(await executor.update());
     }
-    stats.handleResults(await executor.update(ns));
 
     // Nuke things!
     autonuke(ns);
 
-    const growTicks = growTime / CONFIG.tickLength;
-    const hackTicks = hackTime / CONFIG.tickLength;
-    const weakenTicks = weakenTime / CONFIG.tickLength;
+    // Hack things
+    await statemachine.tick();
 
-    const moneyRatio = ns.getServerMoneyAvailable(CONFIG.target) / ns.getServerMaxMoney(CONFIG.target);
-    const moneyPerHack =
-      ns.hackAnalyze(CONFIG.target) * ns.hackAnalyzeChance(CONFIG.target) * ns.getServerMaxMoney(CONFIG.target);
+    // Schedule next tick
+    scheduler.setTimeout(tick, CONFIG.tickLength);
+  };
 
-    let wantHacks = 0;
-    let wantGrows = 0;
-    let wantWeakens = 0;
-
-    const SAFETY_MARGIN = 0.1;
-
-    const calcExpectedHacks = () => Math.floor(wantHacks * hackTicks);
-    const calcExpectedGrows = () =>
-      Math.ceil(executor.equivalentThreads(ns, wantGrows, JobType.Grow, JobType.Hack) * growTicks);
-    const calcExpectedWeakens = () =>
-      Math.ceil(executor.equivalentThreads(ns, wantWeakens, JobType.Weaken, JobType.Hack) * weakenTicks);
-
-    const calcGrows = () => {
-      const moneyAfterHacks = Math.max(0, ns.getServerMaxMoney(CONFIG.target) - moneyPerHack * wantHacks);
-      const wantedMultiplier = Math.max(1, ns.getServerMaxMoney(CONFIG.target) / moneyAfterHacks);
-      return Math.ceil(ns.growthAnalyze(CONFIG.target, wantedMultiplier + SAFETY_MARGIN));
-    };
-
-    const calcWeakens = () => {
-      const growSecurityCost = ns.growthAnalyzeSecurity(wantGrows);
-      const hackSecurityCost = ns.hackAnalyzeSecurity(wantHacks);
-      const securityCost = growSecurityCost + hackSecurityCost;
-      const wantedSecurityDecrease = ns.getServerSecurityLevel(CONFIG.target) + securityCost - targetSecurityLevel;
-      let want = 0;
-      while (ns.weakenAnalyze(want) < wantedSecurityDecrease * 3) {
-        want += 1;
-      }
-      return want;
-    };
-
-    const calcMoneyAfterHacks = () => {
-      return Math.max(0, ns.getServerMaxMoney(CONFIG.target) - moneyPerHack * wantHacks);
-    };
-
-    const calcUtil = () => {
-      return (
-        (calcExpectedGrows() + calcExpectedHacks() + calcExpectedWeakens()) /
-        executor.getMaximumThreads(ns, JobType.Hack)
-      );
-    };
-
-    // If we're below the target money ratio, then grow to it
-    if (moneyRatio < CONFIG.targetMoneyRatio ** 2) {
-      ns.print('emergency grow');
-      await killWorkers(ns, JobType.Hack);
-      const wantedMultiplier = ns.getServerMaxMoney(CONFIG.target) / ns.getServerMoneyAvailable(CONFIG.target);
-      wantGrows = Math.ceil(ns.growthAnalyze(CONFIG.target, wantedMultiplier));
-      // Compute the amount of weaken we need to support grows
-      const securityCost = ns.growthAnalyzeSecurity(wantGrows);
-      const wantedSecurityDecrease = ns.getServerSecurityLevel(CONFIG.target) + securityCost - targetSecurityLevel;
-      const weakenImpact = ns.weakenAnalyze(1, 1);
-      wantWeakens = Math.ceil((wantedSecurityDecrease * (1 + SAFETY_MARGIN)) / weakenImpact);
-    } else {
-      // Calculate number of jobs that needs to finish every tick
-      while (calcUtil() < 0.9) {
-        const moneyAfterHacks = calcMoneyAfterHacks();
-        if (moneyAfterHacks <= CONFIG.targetMoneyRatio * ns.getServerMaxMoney(CONFIG.target)) {
-          break;
-        }
-        wantHacks += 1;
-        wantGrows = calcGrows();
-        wantWeakens = calcWeakens();
-      }
-    }
-
-    // Expand grow, weaken threads to take most available capacity
-    const mult = (executor.getMaximumThreads(ns, JobType.Grow) * 0.8) / (calcExpectedGrows() + calcExpectedWeakens());
-    wantGrows *= mult;
-    wantWeakens *= mult;
-
-    // Make super sure we have enough weaken jobs, even after we'll have scheduled all these planned grow jobs
-    // Not the most elegant solution, but I don't fully trust my formulas, and this is foolproof.
-    while (
-      wantGrows > 0 &&
-      ns.weakenAnalyze(wantWeakens) <
-        ns.getServerSecurityLevel(CONFIG.target) +
-          ns.hackAnalyzeSecurity(wantHacks) +
-          ns.growthAnalyzeSecurity(wantGrows)
-    ) {
-      wantWeakens += 1;
-      wantGrows -= 1;
-    }
-
-    // Similarly, make sure we now have enough grows to support hacks
-    while (
-      wantHacks > 0 &&
-      ns.growthAnalyze(CONFIG.target, wantGrows) <
-        ns.getServerMaxMoney(CONFIG.target) / ns.getServerMaxMoney(CONFIG.target) - moneyPerHack * wantHacks
-    ) {
-      wantHacks -= 1;
-    }
-
-    wantHacks = Math.ceil(wantHacks);
-    wantGrows = Math.ceil(wantGrows);
-    wantWeakens = Math.ceil(wantWeakens);
-    stats.expected(calcExpectedHacks(), calcExpectedGrows(), calcExpectedWeakens());
-
-    /*
-      ns.print(
-        fmt.keyValue(
-          ['hacks', wantHacks.toString()],
-          ['grows', wantGrows.toString()],
-          ['weakens', wantWeakens.toString()],
-          ['expUtil', fmt.float(ns, calcUtil())],
-        ),
-      );
-      ns.print('grow ', executor.countThreads(CONFIG.target, JobType.Weaken), ' >= ', calcExpectedWeakens());
-      ns.print('hack ', executor.countThreads(CONFIG.target, JobType.Grow), ' >= ', calcExpectedGrows());
-      */
-    // Start weaken jobs
-    const gotWeakens = await executor.exec(ns, CONFIG.target, JobType.Weaken, wantWeakens * 1.15);
-    //ns.print(`weakens ${gotWeakens}/${wantWeakens}`);
-
-    // Start grow jobs after weakens are mostly up
-    if (executor.countThreads(CONFIG.target, JobType.Weaken) >= calcExpectedWeakens()) {
-      const got = await executor.exec(ns, CONFIG.target, JobType.Grow, wantGrows * 1.05);
-      //ns.print(`grows ${got}/${wantGrows}`);
-    }
-
-    // Start hack jobs after grows are mostly up and we're above the target money ratio
-    if (executor.countThreads(CONFIG.target, JobType.Grow) >= calcExpectedGrows()) {
-      const got = await executor.exec(ns, CONFIG.target, JobType.Hack, wantHacks * 0.8);
-      //ns.print(`hacks ${got}/${wantHacks}`);
-    }
-    await ns.asleep(tickEnd - new Date().getTime());
-    stats.handleResults(await executor.update(ns));
-    await stats.tick(ns);
+  // Hey it's an "event loop"
+  scheduler.setTimeout(tick, 0);
+  while (true) {
+    await ns.asleep(await scheduler.run());
   }
 }

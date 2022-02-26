@@ -22,6 +22,7 @@ function getMaxHackMoneyPerSec(ns: NS, host: string): number {
 }
 
 export async function main(ns: NS): Promise<void> {
+  fmt.init(ns);
   const hosts = discoverHackedHosts(ns);
   const workers = discoverHackedHosts(ns)
     .flatMap(host =>
@@ -54,16 +55,16 @@ export async function main(ns: NS): Promise<void> {
 
     rows.push([
       host,
-      fmt.time(ns, getFullGrowTime(ns, host, workers)),
-      fmt.time(ns, ns.getHackTime(host)),
-      fmt.time(ns, ns.getGrowTime(host)),
-      fmt.time(ns, ns.getWeakenTime(host)),
-      fmt.money(ns, getMaxHackMoneyPerSec(ns, host)),
-      fmt.money(ns, ns.getServerMaxMoney(host)),
+      fmt.time(getFullGrowTime(ns, host, workers)),
+      fmt.time(ns.getHackTime(host)),
+      fmt.time(ns.getGrowTime(host)),
+      fmt.time(ns.getWeakenTime(host)),
+      fmt.money(getMaxHackMoneyPerSec(ns, host)),
+      fmt.money(ns.getServerMaxMoney(host)),
     ]);
   }
 
-  for (const line of fmt.table(ns, headers, ...rows)) {
+  for (const line of fmt.table(headers, ...rows)) {
     ns.tprint(line);
   }
 }

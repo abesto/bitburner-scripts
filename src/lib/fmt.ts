@@ -2,16 +2,22 @@ import { NS } from '@ns';
 
 import { Formats } from 'lib/constants';
 
-export function money(ns: NS, n: number): string {
-  return ns.nFormat(n, Formats.money);
+let _ns: NS;
+
+export function init(ns: NS) {
+  _ns = ns;
 }
 
-export function float(ns: NS, n: number): string {
-  return ns.nFormat(n, Formats.float);
+export function money(n: number): string {
+  return _ns.nFormat(n, Formats.money);
 }
 
-export function time(ns: NS, t: number): string {
-  return ns.tFormat(t);
+export function float(n: number): string {
+  return _ns.nFormat(n, Formats.float);
+}
+
+export function time(t: number): string {
+  return _ns.tFormat(t);
 }
 
 export function keyValue(...items: [string, string][]): string {
@@ -43,7 +49,7 @@ export function keyValueTabulated(...rows: [string, ...[string, string][]][]): s
   return lines;
 }
 
-export function table(ns: NS, headers: string[], ...rows: string[][]): string[] {
+export function table(headers: string[], ...rows: string[][]): string[] {
   const maxColumnLengths = headers.map((header, i) => Math.max(header.length, ...rows.map(row => row[i].length)));
 
   return [
