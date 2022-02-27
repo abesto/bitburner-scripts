@@ -71,3 +71,7 @@ export function parseMoney(x: string | number): number {
   }
   return x;
 }
+
+export function percent(x: number): string {
+  return `${Math.round(x * 100)}%`;
+}

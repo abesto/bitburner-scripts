@@ -416,7 +416,7 @@ export async function main(ns: NS): Promise<void> {
       if (weakenTime < 30000) {
         sleep = 0;
       } else {
-        sleep = weakenTime * 3;
+        sleep = weakenTime * 2;
       }
     }
     scheduler.setTimeout(hackMore, sleep);
