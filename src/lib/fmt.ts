@@ -57,3 +57,17 @@ export function table(headers: string[], ...rows: string[][]): string[] {
     ...rows.map(row => row.map((field, i) => field.padEnd(maxColumnLengths[i])).join('\t')),
   ];
 }
+
+const MoneySuffixes: { [suffix: string]: number } = {
+  k: 3,
+  m: 6,
+  b: 9,
+  t: 12,
+};
+export function parseMoney(x: string | number): number {
+  if (typeof x === 'string') {
+    const [, num, suffix] = x.match(/^\$?([0-9.]+)([a-z]?)$/i) || [];
+    return parseFloat(num) * 10 ** (MoneySuffixes[suffix] || 0);
+  }
+  return x;
+}

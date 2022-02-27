@@ -1,6 +1,3 @@
-emergency stop: kill only hacks finishing in the next 5 seconds
-run against multiple servers? (maybe state machine per server in the same event loop)
-  auto-start when there's a good candidate and enough capacity
 config: don't explode if it's invalid, print and ignore
 fill capacity with grow/weaken jobs to farm xp? maybe as a separate script
 Stats
@@ -8,3 +5,4 @@ Stats
   add expected numbers? or maybe remove
 improve stats to better match new scheduling system
   add nr. of queued jobs
+grafana through downloaded files?
