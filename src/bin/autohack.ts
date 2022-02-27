@@ -335,7 +335,7 @@ class HackOneServer {
   async startup(): Promise<void> {
     // Schedule emergency shutdown
     const emergency = async () => {
-      if (formulas.moneyRatio(this.target) < 0.2) {
+      if (formulas.moneyRatio(this.target) < 0.1) {
         this.stats.handleResults(await this.executor.update());
         await this.executor.emergency(this.target);
         this.stats.handleResults(await this.executor.update());
