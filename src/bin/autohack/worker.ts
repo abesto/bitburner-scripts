@@ -19,7 +19,7 @@ async function send(ns: NS, messageIn: Message): Promise<void> {
       break;
     }
     ns.print('Resend :(');
-    await ns.asleep(Math.random() * splay);
+    await ns.sleep(Math.random() * splay);
   }
 }
 
@@ -32,7 +32,7 @@ export async function main(ns: NS): Promise<void> {
     const message = await readMessage(ns, Port.AutohackCommand);
 
     if (message === null) {
-      await ns.asleep(100 + splay);
+      await ns.sleep(100 + splay);
       continue;
     }
 

@@ -6,6 +6,7 @@
   ],
   "compilerOptions": {
     "module": "esnext",
+    "experimentalDecorators": true,
     "target": "esnext",
     "moduleResolution": "node",
     "noImplicitReturns": true,

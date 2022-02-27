@@ -1,18 +1,10 @@
-import { Statemachine } from '/lib/autohack/statemachine';
-
 import { NS } from '@ns';
 
 import { CONFIG, loadConfig } from 'lib/autohack/config';
 import { initDebug } from 'lib/autohack/debug';
-import {
-  Executor,
-  JobType,
-  Result,
-  scriptDir as executorScriptDir,
-  Scripts as ExecutorScripts,
-} from 'lib/autohack/executor';
+import { Executor, JobType, Result } from 'lib/autohack/executor';
+import { Statemachine } from 'lib/autohack/statemachine';
 import { autonuke } from 'lib/autonuke';
-import { discoverHackedHosts } from 'lib/distributed';
 import * as fmt from 'lib/fmt';
 import * as formulas from 'lib/formulas';
 import { Scheduler } from 'lib/scheduler';
@@ -221,7 +213,7 @@ class Stats {
   }
 
   print(): void {
-    this.ns.print(`== Stats after ${fmt.time(this.time)} target:${CONFIG.target} ==`);
+    this.ns.print(`== Stats at ${new Date()} after ${fmt.time(this.time)} target:${CONFIG.target} ==`);
 
     const utilization = [];
     for (let i = 0; i < this.hackCapacityHistory.length; i += 1) {
@@ -315,16 +307,19 @@ export async function main(ns: NS): Promise<void> {
   stats.print();
 
   // Emergency shutdown
-  scheduler.setInterval(async () => {
-    if (formulas.moneyRatio(CONFIG.target) < CONFIG.targetMoneyRatio ** 3) {
-      await executor.killWorkers(JobType.Hack);
+  const emergency = async () => {
+    if (formulas.moneyRatio(CONFIG.target) < 0.2) {
+      stats.handleResults(await executor.update());
+      await executor.emergency();
       stats.handleResults(await executor.update());
     }
-  }, 100);
+    scheduler.setTimeout(emergency, 100);
+  };
+  await emergency();
 
   // Get more / better servers if we need them, to easily move to bigger targets
   // This can run relatively rarely
-  scheduler.setInterval(async () => {
+  const getMoreServers = async () => {
     // TODO move threshold to config
     if ((stats.lastUtil() || 0) > 0.8) {
       const { deleted } = await purchaseWorkers(ns, executor);
@@ -333,10 +328,17 @@ export async function main(ns: NS): Promise<void> {
       }
       stats.handleResults(await executor.update());
     }
-  }, 10000);
+    // TODO move period to config
+    scheduler.setTimeout(getMoreServers, 10000);
+  };
+  await getMoreServers();
 
-  // Not using setInterval because we want to support CONFIG.tickLength changing at runtime
   const tick = async () => {
+    // Round tick times so that (re)starting the script doesn't offset calculations
+    if (ns.getServerMoneyAvailable(CONFIG.target) <= 0) {
+      throw new Error('Oops, server is at 0 money');
+    }
+
     stats.handleResults(await executor.update());
     await stats.tick();
     loadConfig(ns);
@@ -348,12 +350,16 @@ export async function main(ns: NS): Promise<void> {
     await statemachine.tick();
 
     // Schedule next tick
-    scheduler.setTimeout(tick, CONFIG.tickLength);
+    const nextTickAt = Math.round(((Date.now() + CONFIG.tickLength) * CONFIG.tickLength) / CONFIG.tickLength);
+    scheduler.setTimeout(tick, nextTickAt - Date.now());
   };
 
   // Hey it's an "event loop"
   scheduler.setTimeout(tick, 0);
   while (true) {
-    await ns.asleep(await scheduler.run());
+    const sleepAmount = await scheduler.run();
+    if (sleepAmount > 0) {
+      await ns.sleep(sleepAmount);
+    }
   }
 }

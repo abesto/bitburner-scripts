@@ -18,16 +18,20 @@ export async function main(ns: NS): Promise<void> {
     }
 
     if (
-      (ns.args[0] === undefined || ns.args[0] === hostname) &&
+      (ns.args[0] === undefined || ns.args[0] === '--one' || ns.args[0] === hostname) &&
       !ns.getServer(hostname).backdoorInstalled &&
       !ns.getServer(hostname).purchasedByPlayer
     ) {
-      ns.tprint(
+      ns.tprintf(
         `home; ${path
           .filter(h => h != 'home')
           .map(h => `connect ${h}`)
           .join('; ')}; backdoor`,
       );
+
+      if (ns.args[0] === '--one') {
+        return;
+      }
     }
 
     for (const next of ns.scan(hostname)) {
