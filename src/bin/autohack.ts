@@ -157,6 +157,16 @@ class Stats {
     return false;
   }
 
+  lastUtil(): number | null {
+    const i = this.hacks.inProgressHistory.length - 1;
+    return (
+      (this.hacks.inProgressHistory[i] +
+        this.executor.equivalentThreads(this.weakens.inProgressHistory[i], JobType.Weaken, JobType.Hack) +
+        this.executor.equivalentThreads(this.grows.inProgressHistory[i], JobType.Grow, JobType.Hack)) /
+      this.hackCapacityHistory[i]
+    );
+  }
+
   private recordServerState() {
     const server = CONFIG.target;
     this.moneyRatioHistory.push(this.ns.getServerMoneyAvailable(server) / this.ns.getServerMaxMoney(server));
@@ -284,6 +294,7 @@ export async function main(ns: NS): Promise<void> {
   const action = ns.args[0];
   if (action === 'kill') {
     const executor = new Executor(ns);
+    await executor.update();
     await executor.killWorkers();
     return;
   }
@@ -303,20 +314,32 @@ export async function main(ns: NS): Promise<void> {
   await stats.tick();
   stats.print();
 
-  // Not using setInterval because we want to support CONFIG.tickLength changing at runtime
-  const tick = async () => {
-    stats.handleResults(await executor.update());
-    await stats.tick();
+  // Emergency shutdown
+  scheduler.setInterval(async () => {
+    if (formulas.moneyRatio(CONFIG.target) < CONFIG.targetMoneyRatio ** 3) {
+      await executor.killWorkers(JobType.Hack);
+      stats.handleResults(await executor.update());
+    }
+  }, 100);
 
-    loadConfig(ns);
-    // Get more / better servers if we need them
-    if (executor.countAllThreadsHackEquivalent() > executor.getAvailableThreads(JobType.Hack) * 0.8) {
+  // Get more / better servers if we need them, to easily move to bigger targets
+  // This can run relatively rarely
+  scheduler.setInterval(async () => {
+    // TODO move threshold to config
+    if ((stats.lastUtil() || 0) > 0.8) {
       const { deleted } = await purchaseWorkers(ns, executor);
       for (const server of deleted) {
         executor.hostDeleted(server);
       }
       stats.handleResults(await executor.update());
     }
+  }, 10000);
+
+  // Not using setInterval because we want to support CONFIG.tickLength changing at runtime
+  const tick = async () => {
+    stats.handleResults(await executor.update());
+    await stats.tick();
+    loadConfig(ns);
 
     // Nuke things!
     autonuke(ns);

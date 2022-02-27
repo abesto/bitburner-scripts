@@ -1,2 +1,9 @@
-auto-advance to next server (under 2 mins full grow time)
+auto-advance to next server (maybe under 2 mins full grow time)
 config: don't explode if it's invalid, print and ignore
+run against multiple servers? (maybe state machine per server in the same event loop)
+fill with grow/weaken jobs to farm xp? maybe as a separate script
+Stats
+  filter done numbers for active target
+  add expected numbers? or maybe remove
+improve stats to better match new scheduling system
+build a dashboard (grafana?) fed with json downloaded from the game
