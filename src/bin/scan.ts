@@ -23,19 +23,22 @@ export async function main(ns: NS): Promise<void> {
       continue;
     }
 
-    rows.push([
-      host,
-      fmt.time(ns.getHackTime(host)),
-      fmt.time(ns.getGrowTime(host)),
-      fmt.time(ns.getWeakenTime(host)),
-      (
-        (fm.growthFromToMoneyRatio(host, 0.5, 1) * fm.getGrowTime(host)) / 1000 +
-        (fm.weakenForSecurityDecrease(10) * fm.getWeakenTime(host)) / 1000 +
-        (fm.hacksFromToMoneyRatio(host, 1, 0.5) * fm.getHackTime(host)) / 1000
-      ).toString(),
-      fmt.money(ns.getServerMaxMoney(host) * 0.25),
-      fmt.money(ns.getServerMaxMoney(host)),
-    ]);
+    if (ns.args[0] === undefined || ns.args[0] === host) {
+      rows.push([
+        host,
+        fmt.time(ns.getHackTime(host)),
+        fmt.time(ns.getGrowTime(host)),
+        fmt.time(ns.getWeakenTime(host)),
+        fm.estimateStableThreadCount(host, 0.5, 400).toString(),
+        (
+          (fm.growthFromToMoneyRatio(host, 0.5, 1) * fm.getGrowTime(host)) / 1000 +
+          (fm.weakenForSecurityDecrease(10) * fm.getWeakenTime(host)) / 1000 +
+          (fm.hacksFromToMoneyRatio(host, 1, 0.5) * fm.getHackTime(host)) / 1000
+        ).toString(),
+        fmt.money(ns.getServerMaxMoney(host) * 0.25),
+        fmt.money(ns.getServerMaxMoney(host)),
+      ]);
+    }
   }
 
   for (const line of fmt.table(headers, ...rows)) {

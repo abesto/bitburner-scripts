@@ -1,8 +1,6 @@
 config: don't explode if it's invalid, print and ignore
 fill capacity with grow/weaken jobs to farm xp? maybe as a separate script
-Stats
-  filter done numbers for active target
-  add expected numbers? or maybe remove
+pump (grow) companies stock.js invests in?
 improve stats to better match new scheduling system
   add nr. of queued jobs
 grafana through downloaded files?

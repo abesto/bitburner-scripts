@@ -4,20 +4,34 @@ import { parseMoney } from 'lib/fmt';
 
 export interface Config {
   tickLength: number;
+  timeEpsilon: number;
   statsPeriod: number;
+  securityThreshold: number;
   reservedMoney: number;
   targetMoneyRatio: number;
   reservedRam: number;
   debug: string[];
+  concurrentTargets: number;
+  tinyWeakenTime: number;
+  tinyCapacityThreshold: number;
+  serverPurchaseInterval: number;
+  serverPurchaseUtilThreshold: number;
 }
 
 const DEFAULT_CONFIG: Config = {
-  tickLength: 1000,
-  statsPeriod: 30000,
+  tickLength: 400, // you probably want this at timeEpsilon * 8
+  statsPeriod: 5000,
+  securityThreshold: 5,
+  timeEpsilon: 50,
   reservedMoney: 0,
   targetMoneyRatio: 0.75,
   reservedRam: 16,
   debug: [],
+  concurrentTargets: 5,
+  tinyWeakenTime: 30000,
+  tinyCapacityThreshold: 0.1,
+  serverPurchaseInterval: 5000,
+  serverPurchaseUtilThreshold: 0.7,
 };
 
 export const CONFIG = DEFAULT_CONFIG;

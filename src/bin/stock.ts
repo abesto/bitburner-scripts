@@ -41,8 +41,8 @@ async function buyFor(ns: NS, money: number, print: (msg: string) => void): Prom
       break;
     }
 
-    if (score(ns, target) < 0.5) {
-      print(`Best stock to buy: ${target} has score ${score(ns, target)}. That's < 0.5, not buying`);
+    if (score(ns, target) < 0.6) {
+      print(`Best stock to buy: ${target} has score ${fmt.float(score(ns, target))}. That's < 0.6, not buying`);
       break;
     }
 
@@ -54,6 +54,8 @@ async function buyFor(ns: NS, money: number, print: (msg: string) => void): Prom
     );
     if (ns.stock.buy(target, stonks) > 0) {
       spent += buyin;
+      ns.print(`Bought ${stonks} ${target} for ${fmt.money(buyin)}`);
+      ns.toast(`Bought ${stonks} ${target} for ${fmt.money(buyin)}`);
     }
   }
 
@@ -93,13 +95,19 @@ export async function main(ns: NS): Promise<void> {
         const buyin = stonks * avgPrice;
         const gain = ns.stock.getSaleGain(symbol, stonks, 'Long') - buyin;
         if (!(symbol in lastGains) || lastGains[symbol] !== gain) {
-          ns.print(`${symbol} Gain: ${fmt.money(gain)} (${fmt.percent(gain / buyin)})`);
+          //ns.print(`${symbol} Gain: ${fmt.money(gain)} (${fmt.percent(gain / buyin)})`);
           lastGains[symbol] = gain;
         }
         if (ns.stock.getForecast(symbol) < 0.5) {
-          ns.print(`Selling ${stonks} ${symbol} for final gain of ${fmt.money(gain)}`);
-          if (ns.stock.sell(symbol, stonks) > 0) {
+          const price = ns.stock.sell(symbol, stonks);
+          const profit = stonks * (price - avgPrice);
+          if (price > 0) {
+            ns.print(`Selling ${stonks} ${symbol} for final gain of ${fmt.money(profit)}`);
+            ns.toast(`Sold ${stonks} ${symbol}. Profit: ${fmt.money(profit)}`, 'success', 7000);
             delete lastGains[symbol];
+          } else {
+            ns.print(`Failed to sell ${stonks} ${symbol}`);
+            ns.toast(`Failed to sell ${stonks} ${symbol}`, 'error', 10000);
           }
         }
       }

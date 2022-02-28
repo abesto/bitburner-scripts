@@ -196,8 +196,11 @@ class Stats {
       fmt.float(this.moneyRatioHistory.reduce((a, b) => a + b, 0) / this.moneyRatioHistory.length),
       // money gained
       fmt.money(this.hacks.impact),
-      // security
-      fmt.float(this.securityLevelHistory.reduce((a, b) => a + b, 0) / this.securityLevelHistory.length),
+      // security over minimum
+      fmt.float(
+        this.securityLevelHistory.reduce((a, b) => a + b, 0) / this.securityLevelHistory.length -
+          this.ns.getServerMinSecurityLevel(this.target),
+      ),
       // hacks in-flight | done
       `${this.formatInProgress(this.hacks.inProgressHistory)}/${this.hacks.finished}`,
       // grows in-flight | done
@@ -255,7 +258,11 @@ class Stats {
 }
 
 class AggStats {
+  // TODO add lifetime sum and per-second money display
   stats: Stats[] = [];
+  lifetimeMoney = 0;
+  lifetime = 0;
+  lastMinuteMoney: { money: number; time: number }[] = [];
   time = 0;
 
   constructor(private ns: NS) {}
@@ -269,6 +276,7 @@ class AggStats {
       await stats.tick();
     }
     this.time += CONFIG.tickLength;
+    this.lifetime += CONFIG.tickLength;
     if (this.time >= CONFIG.statsPeriod) {
       this.print();
       this.reset();
@@ -285,13 +293,18 @@ class AggStats {
   }
 
   print(): void {
-    this.ns.print(`== Stats at ${new Date()} after ${fmt.time(this.time)} ==`);
     const rows = this.stats.map(s => s.shortFields()).filter(r => r[6] !== '0/0');
+    const money = rows.map(r => fmt.parseMoney(r[2])).reduce((a, b) => a + b, 0);
+    this.lifetimeMoney += money;
+    const now = Date.now();
+    this.lastMinuteMoney.push({ money, time: now });
+    this.lastMinuteMoney = this.lastMinuteMoney.filter(m => m.time > now - 60 * 1000);
+    this.ns.print(`== Stats at ${new Date()} after ${fmt.time(this.time)} ==`);
     const totals = [
       'TOTAL/AVG',
       fmt.float(rows.map(r => parseFloat(r[1])).reduce((a, b) => a + b, 0) / rows.length),
-      fmt.money(rows.map(r => fmt.parseMoney(r[2])).reduce((a, b) => a + b, 0)),
-      fmt.float(rows.map(r => parseFloat(r[3])).reduce((a, b) => a + b, 0) / rows.length),
+      fmt.money(money),
+      fmt.float(rows.map(r => parseFloat(r[3])).reduce((a, b) => a + b, 0)),
       rows
         .map(r => r[4].split('/').map(s => parseInt(s)))
         .reduce((a, b) => [a[0] + b[0], a[1] + b[1]], [0, 0])
@@ -306,13 +319,24 @@ class AggStats {
         .join('/'),
     ];
     for (const line of fmt.table(
-      ['target', 'money-ratio', 'gain', 'security', 'hacks', 'grows', 'weakens'],
+      ['target', 'money-ratio', 'gain', 'security-over-min', 'hacks', 'grows', 'weakens'],
       ...rows,
       totals,
     )) {
       this.ns.print(line);
     }
-    this.ns.print(`Utilization: ${fmt.float(calcUtil(this.ns))}`);
+    this.ns.print(
+      fmt.keyValue(
+        ['utilization', fmt.float(calcUtil(this.ns))],
+        ['lifetime', fmt.time(this.lifetime)],
+        ['lifetime-money', fmt.money(this.lifetimeMoney)],
+        ['lifetime-per-sec', fmt.money(this.lifetimeMoney / (this.lifetime / 1000))],
+        [
+          'last-minute-per-sec',
+          fmt.money(this.lastMinuteMoney.reduce((a, b) => a + b.money, 0) / Math.min(60, this.lifetime / 1000)),
+        ],
+      ),
+    );
   }
 }
 
@@ -340,7 +364,7 @@ class HackOneServer {
         await this.executor.emergency(this.target);
         this.stats.handleResults(await this.executor.update());
       }
-      this.scheduler.setTimeout(emergency, 100);
+      this.scheduler.setTimeout(emergency, CONFIG.tickLength);
     };
     await emergency();
   }
@@ -386,15 +410,13 @@ export async function main(ns: NS): Promise<void> {
   // Get more / better servers if we need them, to easily move to bigger targets
   // This can run relatively rarely
   const getMoreServers = async () => {
-    // TODO move threshold to config
-    if (calcUtil(ns) > 0.7) {
+    if (calcUtil(ns) > CONFIG.serverPurchaseUtilThreshold) {
       const { deleted } = await purchaseWorkers(ns, executor);
       for (const server of deleted) {
         executor.hostDeleted(server);
       }
     }
-    // TODO move period to config
-    scheduler.setTimeout(getMoreServers, 5000);
+    scheduler.setTimeout(getMoreServers, CONFIG.serverPurchaseInterval);
   };
   await getMoreServers();
 
@@ -406,14 +428,17 @@ export async function main(ns: NS): Promise<void> {
     let sleep = 10000;
     if (calcUtil(ns) < 0.7) {
       const candidates = servers.filter(s => !(s in hacks) && ns.getServerMaxMoney(s) > 0);
-      const target = candidates.sort((a, b) => ns.getWeakenTime(a) - ns.getWeakenTime(b))[0];
+      const capacity = executor.getAvailableThreads(JobType.Grow);
+      const score = (s: string) =>
+        formulas.estimateStableThreadCount(s, CONFIG.targetMoneyRatio, CONFIG.tickLength) / capacity;
+      const target = candidates.sort((a, b) => score(a) - score(b))[0];
       hacks[target] = new HackOneServer(ns, target, executor, scheduler, aggStats);
       await hacks[target].startup();
       ns.print(`Starting autohack against ${target}`);
 
       // Quickly start up against all tiny servers; let others start workers before we look at utilization again
       const weakenTime = formulas.getWeakenTime(target);
-      if (weakenTime < 30000) {
+      if (weakenTime < CONFIG.tinyWeakenTime || score(target) < CONFIG.tinyCapacityThreshold) {
         sleep = 0;
       } else {
         sleep = weakenTime * 2;
@@ -437,18 +462,14 @@ export async function main(ns: NS): Promise<void> {
     // Run hacks
     const hackedServers = Object.keys(hacks);
     hackedServers.sort((a, b) => ns.getWeakenTime(b) - ns.getWeakenTime(a));
-    // TODO move limit to config, maybe tweak it at runtime based on how long each tick takes to process
-    const topHackedServers = hackedServers.slice(0, 5);
+    const topHackedServers = hackedServers.slice(0, CONFIG.concurrentTargets);
     const topHacks = topHackedServers.map(s => hacks[s]);
+
     const results = await executor.update();
     for (const hack of topHacks) {
       hack.handleResults(results);
       await hack.tick();
       await ns.asleep(0);
-      const otherResults = await executor.update();
-      for (const otherHack of topHacks) {
-        otherHack.handleResults(otherResults);
-      }
     }
 
     await aggStats.tick();

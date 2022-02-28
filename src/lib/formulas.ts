@@ -20,10 +20,17 @@ function haveFormulas(): boolean {
   return _haveFormulas;
 }
 
-export function growthForMoneyMultiplier(server: string, targetMultiplier: number): number {
+export function growthForMoneyMultiplier(
+  server: string,
+  targetMultiplier: number,
+  atSecurity: number | null = null,
+): number {
   let threads = Math.ceil(ns.growthAnalyze(server, targetMultiplier));
   if (haveFormulas()) {
-    while (ns.formulas.hacking.growPercent(ns.getServer(server), threads, ns.getPlayer()) < targetMultiplier) {
+    const serverObj = ns.getServer(server);
+    const player = ns.getPlayer();
+    serverObj.hackDifficulty = atSecurity || serverObj.minDifficulty;
+    while (ns.formulas.hacking.growPercent(serverObj, threads, player) < targetMultiplier) {
       threads++;
     }
   }
@@ -36,8 +43,13 @@ export function growthToTargetMoneyRatio(server: string, targetMoneyRatio: numbe
   return growthForMoneyMultiplier(server, targetMultiplier);
 }
 
-export function growthFromToMoneyRatio(server: string, from: number, to: number): number {
-  return growthForMoneyMultiplier(server, to / from);
+export function growthFromToMoneyRatio(
+  server: string,
+  from: number,
+  to: number,
+  atSecurity: number | null = null,
+): number {
+  return growthForMoneyMultiplier(server, to / from, atSecurity);
 }
 
 export function almostEquals(a: number, b: number, epsilon: number): boolean {
@@ -51,7 +63,9 @@ export function getBaseLog(base: number, x: number): number {
 export function hacksFromToMoneyRatio(server: string, from: number, to: number): number {
   const targetPercent = from - to;
   if (haveFormulas()) {
-    const hackPercent = ns.formulas.hacking.hackPercent(ns.getServer(server), ns.getPlayer());
+    const serverObj = ns.getServer(server);
+    serverObj.hackDifficulty = serverObj.minDifficulty;
+    const hackPercent = ns.formulas.hacking.hackPercent(serverObj, ns.getPlayer());
     return Math.ceil(targetPercent / hackPercent);
     //return Math.ceil(getBaseLog(1 - hackPercent, targetPercent));
   }
@@ -62,7 +76,12 @@ export function hacksFromToMoneyRatio(server: string, from: number, to: number):
 
 export function weakenForSecurityDecrease(security: number): number {
   // This makes the bold assumption that weakens are linear
-  return Math.ceil(security / ns.weakenAnalyze(1));
+  let threads = Math.ceil(security / ns.weakenAnalyze(1));
+  // It seems to not work very well, and I can't find a much better way, so...
+  while (ns.weakenAnalyze(threads) < security) {
+    threads++;
+  }
+  return threads;
 }
 
 export function weakenToMinimum(server: string): number {
@@ -88,14 +107,27 @@ export function getWeakenTime(server: string): number {
 
 export function getHackTime(server: string): number {
   if (haveFormulas()) {
-    return ns.formulas.hacking.growTime(ns.getServer(server), ns.getPlayer());
+    const serverObj = ns.getServer(server);
+    serverObj.hackDifficulty = serverObj.minDifficulty;
+    return ns.formulas.hacking.growTime(serverObj, ns.getPlayer());
   }
   return ns.getHackTime(server);
 }
 
 export function getGrowTime(server: string): number {
   if (haveFormulas()) {
-    return ns.formulas.hacking.growTime(ns.getServer(server), ns.getPlayer());
+    const serverObj = ns.getServer(server);
+    serverObj.hackDifficulty = serverObj.minDifficulty;
+    return ns.formulas.hacking.growTime(serverObj, ns.getPlayer());
   }
   return ns.getGrowTime(server);
+}
+
+export function estimateStableThreadCount(server: string, targetMoneyRatio: number, tickLength: number): number {
+  // This is a VERY rough estimate, but it's good enough for skipping too-small servers
+  const hacksPerBatch = hacksFromToMoneyRatio(server, 1, targetMoneyRatio);
+  const growsPerBatch = growthFromToMoneyRatio(server, targetMoneyRatio, 1);
+  const weakensPerBatch = weakenAfterGrows(growsPerBatch) + weakenAfterHacks(hacksPerBatch);
+  const concurrentBatches = getWeakenTime(server) / tickLength;
+  return Math.round((hacksPerBatch + growsPerBatch + weakensPerBatch) * concurrentBatches);
 }

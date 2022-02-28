@@ -3,7 +3,7 @@ import { NS } from '@ns';
 import { CONFIG, loadConfig } from 'lib/autohack/config';
 import { DEBUG, initDebug } from 'lib/autohack/debug';
 import { Executor, JobType } from 'lib/autohack/executor';
-import { epsilon, timeEpsilon } from 'lib/constants';
+import { epsilon } from 'lib/constants';
 import * as fmt from 'lib/fmt';
 import * as fm from 'lib/formulas';
 import { Scheduler } from 'lib/scheduler';
@@ -77,9 +77,9 @@ export class Statemachine {
     const now = new Date().getTime();
 
     const hackWeakenWillFinishIn = fm.getWeakenTime(target);
-    const growWillFinishIn = hackWeakenWillFinishIn + timeEpsilon * 2;
-    const growWeakenWillFinishIn = growWillFinishIn + timeEpsilon * 2;
-    const hackWillFinishIn = hackWeakenWillFinishIn - timeEpsilon * 2;
+    const growWillFinishIn = hackWeakenWillFinishIn + CONFIG.timeEpsilon * 2;
+    const growWeakenWillFinishIn = growWillFinishIn + CONFIG.timeEpsilon * 2;
+    const hackWillFinishIn = hackWeakenWillFinishIn - CONFIG.timeEpsilon * 2;
 
     const growWillFinishAt = now + growWillFinishIn;
     if (
@@ -100,13 +100,18 @@ export class Statemachine {
     // is incorrect, probably in formulas.ts, but for now this is a workaround.
     const hacksWanted = fm.hacksFromToMoneyRatio(target, 1, CONFIG.targetMoneyRatio);
     const hackWeakensWanted = fm.weakenAfterHacks(hacksWanted * 2);
-    const growsWanted = fm.growthFromToMoneyRatio(target, CONFIG.targetMoneyRatio, 2);
+    const growsWanted = fm.growthFromToMoneyRatio(
+      target,
+      CONFIG.targetMoneyRatio,
+      2,
+      this.ns.getServerMinSecurityLevel(target) + CONFIG.securityThreshold,
+    );
     const growWeakensWanted = fm.weakenAfterGrows(growsWanted * 2);
 
     const trySchedule = async (type: JobType, threads: number): Promise<boolean> => {
       if (
         (type === JobType.Grow || type === JobType.Hack) &&
-        this.ns.getServerSecurityLevel(target) > this.ns.getServerMinSecurityLevel(target) + epsilon
+        this.ns.getServerSecurityLevel(target) > this.ns.getServerMinSecurityLevel(target) + CONFIG.securityThreshold
       ) {
         DEBUG.Statemachine_trySchedule_security(`Skipping ${type}: security level too high`);
         return false;
@@ -137,7 +142,7 @@ export class Statemachine {
           cancelHacks();
         }
       },
-      when: () => hackWeakenWillFinishIn - fm.getWeakenTime(target),
+      when: hackWeakenWillFinishIn - fm.getWeakenTime(target),
     });
 
     // Schedule grows
@@ -149,7 +154,7 @@ export class Statemachine {
           cancelHacks();
         }
       },
-      when: () => startGrowsIn,
+      when: startGrowsIn,
     });
 
     // Schedule grow-weakens
@@ -160,7 +165,7 @@ export class Statemachine {
           cancelHacks();
         }
       },
-      when: () => growWeakenWillFinishIn - fm.getWeakenTime(target),
+      when: growWeakenWillFinishIn - fm.getWeakenTime(target),
     });
 
     // Schedule hacks
@@ -190,7 +195,7 @@ export class Statemachine {
             `Didn't find grows before hack finish time; first grow after is in ${fmt.time(growsAfter.when - now)}`,
           );
         } else if (growsAfter === null && growsBefore !== null) {
-          DEBUG.Statemachine_scheduleWork_noGrowsBefore(
+          DEBUG.Statemachine_scheduleWork_noGrowAfter(
             `Didn't find grows after hack finish time; last grow before is in ${fmt.time(growsBefore.when - now)}`,
           );
         }
@@ -238,7 +243,7 @@ export class Statemachine {
           when: startTime,
         });
       },
-      when: () => startGrowsIn + timeEpsilon,
+      when: () => startGrowsIn + CONFIG.timeEpsilon,
     });
   }
 

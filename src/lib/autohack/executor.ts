@@ -1,8 +1,9 @@
-import { NS } from '@ns';
+import { hasUncaughtExceptionCaptureCallback } from 'process';
+
+import { NS, ProcessInfo } from '@ns';
 
 import { CONFIG, loadConfig } from 'lib/autohack/config';
 import { DEBUG, initDebug } from 'lib/autohack/debug';
-import { timeEpsilon } from 'lib/constants';
 import { discoverHackedHosts } from 'lib/distributed';
 import * as fmt from 'lib/fmt';
 import * as fm from 'lib/formulas';
@@ -75,9 +76,75 @@ class Worker {
   }
 }
 
+function binarySearch<T, V>(arr: T[], compare: (a: T, b: V) => number, target: V): number {
+  let lo = 0;
+  let hi = arr.length - 1;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const cmp = compare(arr[mid], target);
+    if (cmp < 0) {
+      lo = mid + 1;
+    } else if (cmp > 0) {
+      hi = mid - 1;
+    } else {
+      return mid;
+    }
+  }
+  return -1;
+}
+
+function binaryInsert<T>(arr: T[], item: T, compare: (a: T, b: T) => number): void {
+  let lo = 0;
+  let hi = arr.length - 1;
+  while (lo <= hi) {
+    const mid = Math.floor((lo + hi) / 2);
+    const cmp = compare(arr[mid], item);
+    if (cmp < 0) {
+      lo = mid + 1;
+    } else if (cmp > 0) {
+      hi = mid - 1;
+    } else {
+      return;
+    }
+  }
+  arr.splice(lo, 0, item);
+}
+
+class Workers extends Map<number, Worker> {
+  private workersInFinishingOrder: Worker[] = [];
+
+  set(key: number, w: Worker): this {
+    super.set(w.pid, w);
+    binaryInsert(this.workersInFinishingOrder, w, (a, b) => a.expectedEnd - b.expectedEnd);
+    return this;
+  }
+
+  delete(key: number): boolean {
+    const worker = this.get(key);
+    if (worker) {
+      const i = binarySearch(
+        this.workersInFinishingOrder,
+        (mid, target) => mid.expectedEnd - target.expectedEnd,
+        worker,
+      );
+      this.workersInFinishingOrder.splice(i, 1);
+    }
+    return super.delete(key);
+  }
+
+  values(): IterableIterator<Worker> {
+    // Iteration is in order sorted by when the worker is expected to finish
+    return this.workersInFinishingOrder.values();
+  }
+
+  entries(): IterableIterator<[number, Worker]> {
+    throw new Error('Method not implemented.');
+  }
+}
+
 class Host {
-  workers: Worker[] = [];
   scriptRam: { [script: string]: number } = {};
+  workers: Workers = new Workers();
 
   constructor(private ns: NS, readonly name: string) {
     for (const script of Object.keys(Scripts)) {
@@ -86,25 +153,43 @@ class Host {
   }
 
   countThreads(target: string, type: JT): number {
-    return this.workers
-      .filter(w => w.target === target && w.type === type)
-      .map(w => w.threads)
-      .reduce((a, b) => a + b, 0);
+    let threads = 0;
+    for (const worker of this.workers.values()) {
+      if (worker.target === target && worker.type === type) {
+        threads += worker.threads;
+      }
+    }
+    return threads;
   }
 
   countThreadsByType(type: JT): number {
-    return this.workers
-      .filter(w => w.type === type)
-      .map(w => w.threads)
-      .reduce((a, b) => a + b, 0);
+    let threads = 0;
+    for (const worker of this.workers.values()) {
+      if (worker.type === type) {
+        threads += worker.threads;
+      }
+    }
+    return threads;
   }
 
   countAllThreadsHackEquivalent(): number {
-    return this.workers.map(w => equivalentThreads(this.ns, w.threads, w.type, JT.Hack)).reduce((a, b) => a + b, 0);
+    let threads = 0;
+    for (const worker of this.workers.values()) {
+      if (worker.type === JT.Hack) {
+        threads += equivalentThreads(this.ns, worker.threads, worker.type, JT.Hack);
+      }
+    }
+    return threads;
   }
 
   findWorkersEndingAlmostSimultaneously(anchor: Worker): Worker[] {
-    const relevantWorkers = this.workers.filter(w => w.target === anchor.target && w.type === anchor.type);
+    const relevantWorkers = [];
+    for (const worker of this.workers.values()) {
+      if (worker.type === anchor.type && worker.target === anchor.target) {
+        relevantWorkers.push(worker);
+      }
+    }
+
     const anchorIndex = relevantWorkers.findIndex(w => w === anchor);
     const queue = [anchorIndex - 1, anchorIndex + 1];
     const seen = new Set<number>([anchorIndex]);
@@ -120,8 +205,8 @@ class Host {
       seen.add(index);
       const w = relevantWorkers[index];
       if (
-        fm.almostEquals(w.expectedEnd, matched[0].expectedEnd, timeEpsilon) ||
-        fm.almostEquals(w.expectedEnd, matched[matched.length - 1].expectedEnd, timeEpsilon)
+        fm.almostEquals(w.expectedEnd, matched[0].expectedEnd, CONFIG.timeEpsilon) ||
+        fm.almostEquals(w.expectedEnd, matched[matched.length - 1].expectedEnd, CONFIG.timeEpsilon)
       ) {
         matched.push(w);
         queue.push(index - 1, index + 1);
@@ -132,8 +217,13 @@ class Host {
 
   countThreadsFinishingAt(type: JT, target: string, time: number): { threads: number; when: number } | null {
     // Find ONE worker that matches the query
-    const relevantWorkers = this.workers.filter(w => w.target === target && w.type === type);
-    const anchorIndex = relevantWorkers.findIndex(w => fm.almostEquals(w.expectedEnd, time, timeEpsilon));
+    const relevantWorkers = [];
+    for (const worker of this.workers.values()) {
+      if (worker.target === target && worker.type === type) {
+        relevantWorkers.push(worker);
+      }
+    }
+    const anchorIndex = relevantWorkers.findIndex(w => fm.almostEquals(w.expectedEnd, time, CONFIG.timeEpsilon));
     if (anchorIndex === -1) {
       return null;
     }
@@ -149,16 +239,22 @@ class Host {
   }
 
   countThreadsFinishingBetween(type: JT, target: string, start: number, end: number): number {
-    return this.workers
-      .filter(w => w.target === target && w.type === type && w.expectedEnd >= start && w.expectedEnd <= end)
-      .map(w => w.threads)
-      .reduce((a, b) => a + b, 0);
+    let threads = 0;
+    for (const worker of this.workers.values()) {
+      if (worker.target !== target || worker.type !== type || worker.expectedEnd < start) {
+        continue;
+      }
+      if (worker.expectedEnd > end) {
+        break;
+      }
+      threads += worker.threads;
+    }
+    return threads;
   }
 
   countThreadsFinishingJustBefore(type: JT, target: string, time: number): { threads: number; when: number } | null {
     let anchor = null;
-    for (let i = 0; i < this.workers.length; i++) {
-      const w = this.workers[i];
+    for (const w of this.workers.values()) {
       if (
         w.target === target &&
         w.type === type &&
@@ -166,6 +262,9 @@ class Host {
         (anchor === null || w.expectedEnd > anchor.expectedEnd)
       ) {
         anchor = w;
+      }
+      if (w.expectedEnd > time) {
+        break;
       }
     }
 
@@ -182,15 +281,11 @@ class Host {
 
   countThreadsFinishingJustAfter(type: JT, target: string, time: number): { threads: number; when: number } | null {
     let anchor = null;
-    for (let i = 0; i < this.workers.length; i++) {
-      const w = this.workers[i];
-      if (
-        w.target === target &&
-        w.type === type &&
-        w.expectedEnd > time &&
-        (anchor === null || w.expectedEnd < anchor.expectedEnd)
-      ) {
+    // possible optimization: store an index by expected end time
+    for (const w of this.workers.values()) {
+      if (w.target === target && w.type === type && w.expectedEnd > time && anchor === null) {
         anchor = w;
+        break;
       }
     }
 
@@ -217,11 +312,17 @@ class Host {
   }
 
   async update(): Promise<Result[]> {
-    const liveProcesses = this.ns.ps(this.name).filter(p => p.filename.startsWith(`${scriptDir}/`));
-
-    const newProcesses = liveProcesses.filter(p => !this.workers.some(w => w.pid === p.pid));
-    for (const p of newProcesses) {
-      this.workers.push(
+    const liveProcesses: { [pid: string]: ProcessInfo } = {};
+    for (const p of this.ns.ps(this.name)) {
+      if (!p.filename.startsWith(`${scriptDir}/`)) {
+        continue;
+      }
+      liveProcesses[p.pid] = p;
+      if (this.workers.has(p.pid)) {
+        continue;
+      }
+      this.workers.set(
+        p.pid,
         new Worker(
           this.ns,
           this,
@@ -235,37 +336,36 @@ class Host {
       );
     }
 
-    const stoppedWorkers = this.workers.filter(w => !liveProcesses.some(p => p.pid === w.pid));
     const results: Result[] = [];
-    if (stoppedWorkers.length > 0) {
-      for (const worker of stoppedWorkers) {
-        const filename = `/autohack/results/${worker.expectedEnd}-${worker.random}.txt`;
-        if (!(this.name === this.ns.getHostname() || (await this.ns.scp(filename, this.name, this.ns.getHostname())))) {
-          continue;
-        }
-        const workerDataStr = await this.ns.read(filename);
-        if (workerDataStr !== '') {
-          const result = {
-            target: worker.target,
-            type: worker.type,
-            threads: worker.threads,
-            duration: 0,
-            impact: 0,
-          };
-          try {
-            const parsed = JSON.parse(workerDataStr);
-            result.duration = parsed.duration;
-            result.impact = parsed.impact;
-          } finally {
-            results.push(result);
-          }
-        }
-        this.ns.rm(filename);
-        this.ns.rm(filename, this.name);
+    for (const worker of this.workers.values()) {
+      if (worker.pid in liveProcesses) {
+        continue;
       }
+      const filename = `/autohack/results/${worker.expectedEnd}-${worker.random}.txt`;
+      if (!(this.name === this.ns.getHostname() || (await this.ns.scp(filename, this.name, this.ns.getHostname())))) {
+        continue;
+      }
+      const workerDataStr = await this.ns.read(filename);
+      if (workerDataStr !== '') {
+        const result = {
+          target: worker.target,
+          type: worker.type,
+          threads: worker.threads,
+          duration: 0,
+          impact: 0,
+        };
+        try {
+          const parsed = JSON.parse(workerDataStr);
+          result.duration = parsed.duration;
+          result.impact = parsed.impact;
+        } finally {
+          results.push(result);
+        }
+      }
+      this.ns.rm(filename);
+      this.ns.rm(filename, this.name);
+      this.workers.delete(worker.pid);
     }
-
-    this.workers = this.workers.filter(w => liveProcesses.some(p => p.pid === w.pid));
 
     return results;
   }
@@ -290,13 +390,13 @@ class Host {
     if (pid === 0) {
       return false;
     }
-    this.workers.push(new Worker(this.ns, this, target, type, threads, pid, expectedEnd, random));
+    this.workers.set(pid, new Worker(this.ns, this, target, type, threads, pid, expectedEnd, random));
     return true;
   }
 
   async emergency(target: string): Promise<number> {
     let killed = 0;
-    for (const worker of this.workers) {
+    for (const worker of this.workers.values()) {
       if (
         worker.type === JT.Hack &&
         worker.expectedEnd < Date.now() + CONFIG.tickLength * 2 &&
@@ -305,10 +405,10 @@ class Host {
       ) {
         if (await worker.kill()) {
           killed += worker.threads;
+          this.workers.delete(worker.pid);
         }
       }
     }
-    this.workers = this.workers.filter(w => this.ns.isRunning(w.pid, this.name));
     return killed;
   }
 
@@ -353,14 +453,14 @@ class Host {
 
   async killWorkers(type: JT | null): Promise<number> {
     let killed = 0;
-    for (const worker of this.workers) {
+    for (const worker of this.workers.values()) {
       if (type === null || worker.type === type) {
         if (await worker.kill()) {
           killed += worker.threads;
+          this.workers.delete(worker.pid);
         }
       }
     }
-    this.workers = this.workers.filter(w => this.ns.isRunning(w.pid, this.name));
     return killed;
   }
 }
@@ -581,7 +681,9 @@ export class Executor {
 
   async capWorkers(type: JT, target: string, cap: number, from: number, until: number): Promise<void> {
     const workers = this.hosts.flatMap(h =>
-      h.workers.filter(w => w.type === type && w.target === target && w.expectedEnd >= from && w.expectedEnd <= until),
+      [...h.workers.values()].filter(
+        w => w.type === type && w.target === target && w.expectedEnd >= from && w.expectedEnd <= until,
+      ),
     );
     workers.sort((a, b) => a.threads - b.threads);
 
