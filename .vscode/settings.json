@@ -1,7 +1,4 @@
 {
-    // Linter Settings
-    "typescript.validate.enable": false,
-    "javascript.validate.enable": false,
     "eslint.validate": [
         "typescript",
         "typescriptreact"

@@ -1,12 +1,7 @@
-import { hasUncaughtExceptionCaptureCallback } from 'process';
-
 import { NS, ProcessInfo } from '@ns';
 
-import { CONFIG, loadConfig } from 'lib/autohack/config';
-import { DEBUG, initDebug } from 'lib/autohack/debug';
+import { AutohackContext } from 'lib/autohack/context';
 import { discoverHackedHosts } from 'lib/distributed';
-import * as fmt from 'lib/fmt';
-import * as fm from 'lib/formulas';
 
 export enum JobType {
   Hack = 'hack',
@@ -146,10 +141,22 @@ class Host {
   scriptRam: { [script: string]: number } = {};
   workers: Workers = new Workers();
 
-  constructor(private ns: NS, readonly name: string) {
+  constructor(private ctx: AutohackContext, readonly name: string) {
     for (const script of Object.keys(Scripts)) {
-      this.scriptRam[script] = ns.getScriptRam(Scripts[script as keyof typeof Scripts], name);
+      this.scriptRam[script] = ctx.ns.getScriptRam(Scripts[script as keyof typeof Scripts], name);
     }
+  }
+
+  private get ns(): NS {
+    return this.ctx.ns;
+  }
+
+  private get timeEpsilon(): number {
+    return this.ctx.config.timeEpsilon;
+  }
+
+  private almostEquals(a: number, b: number): boolean {
+    return this.ctx.formulas.almostEquals(a, b, this.timeEpsilon);
   }
 
   countThreads(target: string, type: JT): number {
@@ -175,8 +182,10 @@ class Host {
   countAllThreadsHackEquivalent(): number {
     let threads = 0;
     for (const worker of this.workers.values()) {
-      if (worker.type === JT.Hack) {
+      if (worker.type !== JT.Hack) {
         threads += equivalentThreads(this.ns, worker.threads, worker.type, JT.Hack);
+      } else {
+        threads += worker.threads;
       }
     }
     return threads;
@@ -205,8 +214,8 @@ class Host {
       seen.add(index);
       const w = relevantWorkers[index];
       if (
-        fm.almostEquals(w.expectedEnd, matched[0].expectedEnd, CONFIG.timeEpsilon) ||
-        fm.almostEquals(w.expectedEnd, matched[matched.length - 1].expectedEnd, CONFIG.timeEpsilon)
+        this.almostEquals(w.expectedEnd, matched[0].expectedEnd) ||
+        this.almostEquals(w.expectedEnd, matched[matched.length - 1].expectedEnd)
       ) {
         matched.push(w);
         queue.push(index - 1, index + 1);
@@ -223,7 +232,7 @@ class Host {
         relevantWorkers.push(worker);
       }
     }
-    const anchorIndex = relevantWorkers.findIndex(w => fm.almostEquals(w.expectedEnd, time, CONFIG.timeEpsilon));
+    const anchorIndex = relevantWorkers.findIndex(w => this.almostEquals(w.expectedEnd, time));
     if (anchorIndex === -1) {
       return null;
     }
@@ -372,11 +381,11 @@ class Host {
 
   private jobTime(type: JT, target: string): number {
     if (type === JT.Hack) {
-      return fm.getHackTime(target);
+      return this.ctx.formulas.getHackTime(target);
     } else if (type === JT.Grow) {
-      return fm.getGrowTime(target);
+      return this.ctx.formulas.getGrowTime(target);
     } else if (type === JT.Weaken) {
-      return fm.getWeakenTime(target);
+      return this.ctx.formulas.getWeakenTime(target);
     } else {
       throw new Error(`Unknown job type: ${type}`);
     }
@@ -399,7 +408,7 @@ class Host {
     for (const worker of this.workers.values()) {
       if (
         worker.type === JT.Hack &&
-        worker.expectedEnd < Date.now() + CONFIG.tickLength * 2 &&
+        worker.expectedEnd < Date.now() + this.ctx.tickLength * 2 &&
         worker.target === target &&
         this.ns.isRunning(worker.pid, this.name)
       ) {
@@ -413,10 +422,9 @@ class Host {
   }
 
   private get maxUsableRam(): number {
-    loadConfig(this.ns);
     const ram = this.ns.getServerMaxRam(this.name);
     if (this.name === this.ns.getHostname()) {
-      return ram - CONFIG.reservedRam;
+      return ram - this.ctx.config.reservedRam;
     }
     return ram;
   }
@@ -431,7 +439,7 @@ class Host {
   }
 
   getMaximumThreads(type: JT): number {
-    DEBUG.Executor_GetMaximumThreads(
+    this.ctx.debug.Executor_GetMaximumThreads(
       `${this.name} usable=${this.maxUsableRam} type=${type} script=${Scripts[type]} scriptRam=${this.getScriptRam(
         type,
       )}`,
@@ -468,10 +476,10 @@ class Host {
 export class Executor {
   private hosts: Host[] = [];
 
-  constructor(private ns: NS) {
-    fm.init(ns);
-    fmt.init(ns);
-    initDebug(ns);
+  constructor(private ctx: AutohackContext) {}
+
+  private get ns(): NS {
+    return this.ctx.ns;
   }
 
   getAvailableThreads(type: JT): number {
@@ -519,8 +527,8 @@ export class Executor {
       return this.hosts.map(h => h.countThreadsFinishingAt(type, target, after.when));
     });
 
-    DEBUG.Executor_future_Executor_countThreadsFinishingJustAround(
-      fmt.keyValue(
+    this.ctx.debug.Executor_future_Executor_countThreadsFinishingJustAround(
+      this.ctx.fmt.keyValue(
         ['anchors', anchors.length.toString()],
         ['before', before.length.toString()],
         ['after', after.length.toString()],
@@ -588,7 +596,7 @@ export class Executor {
         if (this.ns.getServerMaxRam(hostname) === 0) {
           continue;
         }
-        const host = new Host(this.ns, hostname);
+        const host = new Host(this.ctx, hostname);
         await host.deploy();
 
         this.hosts = this.hosts.filter(h => h.name !== hostname);
@@ -643,7 +651,7 @@ export class Executor {
         } else {
           this.ns.print(`Failed to start ${toExec} ${type} threads on ${host.name}`);
           this.ns.print(
-            fmt.keyValue(
+            this.ctx.fmt.keyValue(
               ['available', available.toString()],
               ['toExec', toExec.toString()],
               ['freeRam', (this.ns.getServerMaxRam(host.name) - this.ns.getServerUsedRam(host.name)).toString()],
@@ -655,7 +663,7 @@ export class Executor {
     }
 
     if (started < threads) {
-      DEBUG.Executor_notEnoughThreads(`Failed to start ${threads} ${type} threads: got only ${started}`);
+      this.ctx.debug.Executor_notEnoughThreads(`Failed to start ${threads} ${type} threads: got only ${started}`);
     }
     return started;
   }
@@ -711,5 +719,9 @@ export class Executor {
       return await hostObj.killWorkers(type);
     }
     return 0;
+  }
+
+  get utilization(): number {
+    return this.countAllThreadsHackEquivalent() / this.getMaximumThreads(JT.Hack);
   }
 }

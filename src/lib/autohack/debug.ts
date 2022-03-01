@@ -1,10 +1,8 @@
-import { NS } from '@ns';
+import { AutohackContext } from 'lib/autohack/context';
+import { Debug as LibDebug } from 'lib/debug';
 
-import { CONFIG, loadConfig } from 'lib/autohack/config';
-import { _ns, Debug as LibDebug, init as libInit } from 'lib/debug';
-
-export const initDebug = libInit;
-export const DEBUG = LibDebug((category: string) => {
-  loadConfig(_ns);
-  return CONFIG.debug.includes(category);
-});
+export type Debug = LibDebug;
+export const Debug = (ctx: AutohackContext): LibDebug =>
+  LibDebug(ctx.ns, (category: string) => {
+    return ctx.config.debug.includes(category);
+  });

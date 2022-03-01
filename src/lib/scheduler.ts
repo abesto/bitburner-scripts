@@ -59,7 +59,7 @@ export class Scheduler {
     }
     const timeToSleep = next - Date.now();
     if (timeToSleep > 1000) {
-      this.ns.print(`Scheduler will run again in ${Math.round(timeToSleep / 1000)}s`);
+      //this.ns.print(`Scheduler will run again in ${Math.round(timeToSleep / 1000)}s`);
     }
     return timeToSleep;
   }

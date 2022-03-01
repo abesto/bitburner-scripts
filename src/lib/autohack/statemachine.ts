@@ -1,11 +1,11 @@
+import { Debug } from '/lib/debug';
+
 import { NS } from '@ns';
 
-import { CONFIG, loadConfig } from 'lib/autohack/config';
-import { DEBUG, initDebug } from 'lib/autohack/debug';
+import { Config } from 'lib/autohack/config';
+import { AutohackContext } from 'lib/autohack/context';
 import { Executor, JobType } from 'lib/autohack/executor';
-import { epsilon } from 'lib/constants';
-import * as fmt from 'lib/fmt';
-import * as fm from 'lib/formulas';
+import { Formulas } from 'lib/formulas';
 import { Scheduler } from 'lib/scheduler';
 
 enum State {
@@ -16,16 +16,33 @@ enum State {
 
 export class Statemachine {
   private state: State = State.Startup;
+  private dbg: Debug;
 
-  constructor(private ns: NS, private target: string, private executor: Executor, private scheduler: Scheduler) {
-    initDebug(ns);
-    fm.init(ns);
-    fmt.init(ns);
-    loadConfig(this.ns);
+  constructor(private ctx: AutohackContext, private target: string) {
+    this.dbg = this.ctx.debug.withCategoryPrefix(`Statemachine_${target}`);
+  }
+
+  private get ns(): NS {
+    return this.ctx.ns;
+  }
+
+  private get cfg(): Config {
+    return this.ctx.config;
+  }
+
+  private get fm(): Formulas {
+    return this.ctx.formulas;
+  }
+
+  private get executor(): Executor {
+    return this.ctx.executor;
+  }
+
+  private get scheduler(): Scheduler {
+    return this.ctx.scheduler;
   }
 
   async tick(): Promise<void> {
-    loadConfig(this.ns);
     switch (this.state) {
       case State.Startup:
         await this.startup();
@@ -41,31 +58,31 @@ export class Statemachine {
 
   private async startup(): Promise<void> {
     // Discover whether we're in the initial grow phase.
-    if (fm.moneyRatio(this.target) < CONFIG.targetMoneyRatio ** 2) {
+    if (this.fm.moneyRatio(this.target) < this.cfg.targetMoneyRatio ** 2) {
       this.state = State.InitialGrow;
     } else {
       this.state = State.Hacking;
     }
-    DEBUG.Statemachine_Transition(`Booting into ${this.state}`);
+    this.dbg.Transition(`Booting into ${this.state}`);
     await this.tick();
   }
 
   private async initialGrow(): Promise<void> {
     // Grow until we're at the target money ratio.
     if (
-      fm.moneyRatio(this.target) < 1 ||
+      this.fm.moneyRatio(this.target) < 1 ||
       this.ns.getServerSecurityLevel(this.target) > this.ns.getServerMinSecurityLevel(this.target)
     ) {
-      const grows = fm.growthToTargetMoneyRatio(this.target, 1);
+      const grows = this.fm.growthToTargetMoneyRatio(this.target, 1);
       await this.executor.execUpTo(this.target, JobType.Grow, grows);
       await this.executor.execUpTo(
         this.target,
         JobType.Weaken,
-        fm.weakenAfterGrows(grows) + fm.weakenToMinimum(this.target),
+        this.fm.weakenAfterGrows(grows) + this.fm.weakenToMinimum(this.target),
       );
     } else {
       this.state = State.Hacking;
-      DEBUG.Statemachine_Transition('Initial grow complete, switching to hacking');
+      this.dbg.Transition('Initial grow complete, switching to hacking');
       await this.tick();
     }
   }
@@ -73,69 +90,66 @@ export class Statemachine {
   private async scheduleWork(): Promise<void> {
     // Schedule, ending 2 * timeEpsilon from each other: hack, weaken, grow, weaken
     const target = this.target;
+    const dbg = this.dbg.withCategoryPrefix('scheduleWork');
+    const fmt = this.ctx.fmt;
+    const fm = this.fm;
 
     const now = new Date().getTime();
 
     const hackWeakenWillFinishIn = fm.getWeakenTime(target);
-    const growWillFinishIn = hackWeakenWillFinishIn + CONFIG.timeEpsilon * 2;
-    const growWeakenWillFinishIn = growWillFinishIn + CONFIG.timeEpsilon * 2;
-    const hackWillFinishIn = hackWeakenWillFinishIn - CONFIG.timeEpsilon * 2;
+    const growWillFinishIn = hackWeakenWillFinishIn + this.cfg.timeEpsilon * 2;
+    const growWeakenWillFinishIn = growWillFinishIn + this.cfg.timeEpsilon * 2;
+    const hackWillFinishIn = hackWeakenWillFinishIn - this.cfg.timeEpsilon * 2;
 
     const growWillFinishAt = now + growWillFinishIn;
     if (
       this.executor.countThreadsFinishingBetween(
         JobType.Hack,
         target,
-        growWillFinishAt - CONFIG.tickLength / 2,
-        growWillFinishAt + CONFIG.tickLength / 2,
+        growWillFinishAt - this.ctx.tickLength / 2,
+        growWillFinishAt + this.ctx.tickLength / 2,
       ) > 0
     ) {
-      DEBUG.Statemachine_scheduleWork_alreadyScheduled(
-        'Hacks already scheduled for the tick that grows started now would finish in',
-      );
+      dbg.alreadyScheduled('Hacks already scheduled for the tick that grows started now would finish in');
       return;
     }
 
     // Add on some arbitrary multipliers because we hit the emergency stop often later in the game. Something somewhere
     // is incorrect, probably in formulas.ts, but for now this is a workaround.
-    const hacksWanted = fm.hacksFromToMoneyRatio(target, 1, CONFIG.targetMoneyRatio);
+    const hacksWanted = fm.hacksFromToMoneyRatio(target, 1, this.cfg.targetMoneyRatio);
     const hackWeakensWanted = fm.weakenAfterHacks(hacksWanted * 2);
     const growsWanted = fm.growthFromToMoneyRatio(
       target,
-      CONFIG.targetMoneyRatio,
+      this.cfg.targetMoneyRatio,
       2,
-      this.ns.getServerMinSecurityLevel(target) + CONFIG.securityThreshold,
+      this.ns.getServerMinSecurityLevel(target) + this.cfg.securityThreshold,
     );
     const growWeakensWanted = fm.weakenAfterGrows(growsWanted * 2);
 
     const trySchedule = async (type: JobType, threads: number): Promise<boolean> => {
       if (
         (type === JobType.Grow || type === JobType.Hack) &&
-        this.ns.getServerSecurityLevel(target) > this.ns.getServerMinSecurityLevel(target) + CONFIG.securityThreshold
+        this.ns.getServerSecurityLevel(target) > this.ns.getServerMinSecurityLevel(target) + this.cfg.securityThreshold
       ) {
-        DEBUG.Statemachine_trySchedule_security(`Skipping ${type}: security level too high`);
+        dbg.trySchedule_security(`Skipping ${type}: security level too high`);
         return false;
       }
 
       const available = this.executor.getAvailableThreads(type);
       if (available < threads) {
-        DEBUG.Statemachine_scheduleWork_notEnoughThreads(
-          `Not enough ${type} threads available (${available} < ${threads})`,
-        );
+        dbg.notEnoughThreads(`Not enough ${type} threads available (${available} < ${threads})`);
         return false;
       }
       const started = await this.executor.exec(target, type, threads);
       if (started < threads) {
-        DEBUG[`Statemachine_scheduleWork_notEnough${type}`](
-          `Tried to start ${threads} ${type}s, but only started ${started}`,
-        );
+        dbg[`notEnough${type}`](`Tried to start ${threads} ${type}s, but only started ${started}`);
         return false;
       }
       return true;
     };
 
     // Schedule hack-weakens
-    await this.scheduler.schedule({
+    this.scheduler.schedule({
       name: 'start-hack-weakens',
       what: async () => {
         if (!(await trySchedule(JobType.Weaken, hackWeakensWanted))) {
@@ -147,7 +161,7 @@ export class Statemachine {
 
     // Schedule grows
     const startGrowsIn = growWillFinishIn - fm.getGrowTime(target);
-    await this.scheduler.schedule({
+    this.scheduler.schedule({
       name: 'start-grows',
       what: async () => {
         if (!(await trySchedule(JobType.Grow, growsWanted))) {
@@ -158,7 +172,7 @@ export class Statemachine {
     });
 
     // Schedule grow-weakens
-    await this.scheduler.schedule({
+    this.scheduler.schedule({
       name: 'start-grow-weakens',
       what: async () => {
         if (!(await trySchedule(JobType.Weaken, growWeakensWanted))) {
@@ -174,7 +188,7 @@ export class Statemachine {
       name: 'start-hacks-wrapper',
       what: async () => {
         if (hacksWanted < 1) {
-          DEBUG.Statemachine_scheduledWork_noHacksNeeded(`hacksWanted=${hacksWanted}`);
+          dbg.noHacksNeeded(`hacksWanted=${hacksWanted}`);
           return;
         }
 
@@ -185,17 +199,17 @@ export class Statemachine {
         );
 
         if (growsBefore === null && growsAfter === null) {
-          DEBUG.Statemachine_scheduleWork_noGrows(
+          dbg.noGrows(
             `Didn't find grows either before or after the hack finish time (in ${fmt.time(
               hackWillFinishIn,
             )}), so can't schedule hacks`,
           );
         } else if (growsBefore === null && growsAfter !== null) {
-          DEBUG.Statemachine_scheduleWork_noGrowsBefore(
+          dbg.noGrowsBefore(
             `Didn't find grows before hack finish time; first grow after is in ${fmt.time(growsAfter.when - now)}`,
           );
         } else if (growsAfter === null && growsBefore !== null) {
-          DEBUG.Statemachine_scheduleWork_noGrowAfter(
+          dbg.noGrowAfter(
             `Didn't find grows after hack finish time; last grow before is in ${fmt.time(growsBefore.when - now)}`,
           );
         }
@@ -203,9 +217,8 @@ export class Statemachine {
           return;
         }
 
-        // Start the hack right in the middle of the two grows
-        const startTime = Math.round((growsAfter.when - now + growsBefore.when - now) / 2);
-        DEBUG.Statemachine_scheduleWork_hacks(`Will start ${hacksWanted} hacks in ${fmt.time(startTime)}`);
+        const startTime = growsAfter.when - Date.now() - 2 * this.cfg.timeEpsilon - fm.getHackTime(target);
+        dbg.hacks(`Will start ${hacksWanted} hacks in ${fmt.time(startTime)}`);
         this.scheduler.schedule({
           name: 'start-hacks',
           what: async () => {
@@ -222,14 +235,12 @@ export class Statemachine {
             }
 
             if (toExec <= 0) {
-              DEBUG.Statemachine_scheduleWork_noHacksNeeded(
-                `No hacks needed, ${hacksExist} hacks exist, ${hacksWanted} wanted`,
-              );
+              dbg.noHacksNeeded(`No hacks needed, ${hacksExist} hacks exist, ${hacksWanted} wanted`);
               return;
             }
 
             // All good, let's go
-            DEBUG.Statemachine_scheduleWork_hacks(
+            dbg.hacks(
               fmt.keyValue(
                 ['growsAfter', growsAfter.threads.toString()],
                 ['hacksWanted', hacksWanted.toString()],
@@ -243,17 +254,8 @@ export class Statemachine {
           when: startTime,
         });
       },
-      when: () => startGrowsIn + CONFIG.timeEpsilon,
+      when: () => startGrowsIn + this.cfg.timeEpsilon,
     });
-  }
-
-  private async emergencyStop(): Promise<void> {
-    const moneyRatio = fm.moneyRatio(this.target);
-    const threshold = 0.1;
-    if (moneyRatio < threshold) {
-      await this.executor.killWorkers(JobType.Hack);
-      DEBUG.Statemachine_emergencyStop(`Emergency stop: money ratio is ${moneyRatio} (less than ${threshold})`);
-    }
   }
 
   private async hacking(): Promise<void> {

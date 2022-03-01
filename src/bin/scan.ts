@@ -1,17 +1,33 @@
-import { discoverHackedHosts } from '/lib/distributed';
+import { AutohackContext } from '/lib/autohack/context';
 
 import { NS } from '@ns';
 
-import * as fmt from 'lib/fmt';
-import * as fm from 'lib/formulas';
+import { JobType } from 'lib/autohack/executor';
+import { discoverHackedHosts } from 'lib/distributed';
 
 export async function main(ns: NS): Promise<void> {
-  fmt.init(ns);
-  fm.init(ns);
+  const ctx = new AutohackContext(ns);
+  ctx.loadConfig();
   const hosts = discoverHackedHosts(ns);
   hosts.sort((a, b) => ns.getServerMaxMoney(a) - ns.getServerMaxMoney(b));
 
-  const headers = ['Host', 'Hack Time', 'Grow Time', 'Weaken Time', 'Est. Workers', '25% Money', 'Max Money'];
+  const flags = ns.flags([
+    ['host', ''],
+    ['tickLength', ctx.tickLength],
+    ['targetMoneyRatio', ctx.config.targetMoneyRatio],
+  ]);
+  // @ts-ignore
+  ns.tprint(ctx.fmt.keyValue(...Object.entries(flags).map(([k, v]) => [k, v.toString()])));
+
+  const headers = [
+    'Host',
+    'Hack Time',
+    'Grow Time',
+    'Weaken Time',
+    'Est. Workers',
+    'Max Money',
+    `${ctx.fmt.percent(flags.targetMoneyRatio)} Money per worker`,
+  ];
   const rows: string[][] = [];
 
   for (const host of hosts) {
@@ -19,29 +35,26 @@ export async function main(ns: NS): Promise<void> {
       continue;
     }
 
-    if (ns.getServer(host).moneyMax === 0 || ns.getServer(host).moneyAvailable === 0) {
-      continue;
-    }
-
-    if (ns.args[0] === undefined || ns.args[0] === host) {
+    if (flags.host === '' || flags.host === host) {
       rows.push([
         host,
-        fmt.time(ns.getHackTime(host)),
-        fmt.time(ns.getGrowTime(host)),
-        fmt.time(ns.getWeakenTime(host)),
-        fm.estimateStableThreadCount(host, 0.5, 400).toString(),
-        (
-          (fm.growthFromToMoneyRatio(host, 0.5, 1) * fm.getGrowTime(host)) / 1000 +
-          (fm.weakenForSecurityDecrease(10) * fm.getWeakenTime(host)) / 1000 +
-          (fm.hacksFromToMoneyRatio(host, 1, 0.5) * fm.getHackTime(host)) / 1000
-        ).toString(),
-        fmt.money(ns.getServerMaxMoney(host) * 0.25),
-        fmt.money(ns.getServerMaxMoney(host)),
+        ctx.fmt.time(ns.getHackTime(host)),
+        ctx.fmt.time(ns.getGrowTime(host)),
+        ctx.fmt.time(ns.getWeakenTime(host)),
+        ctx.formulas.estimateStableThreadCount(host, flags.targetMoneyRatio, flags.tickLength).toString(),
+        ctx.fmt.money(ns.getServerMaxMoney(host)),
+        ctx.fmt.money(
+          (ns.getServerMaxMoney(host) * flags.targetMoneyRatio) /
+            ctx.formulas.estimateStableThreadCount(host, flags.targetMoneyRatio, flags.tickLength),
+        ),
       ]);
     }
   }
 
-  for (const line of fmt.table(headers, ...rows)) {
+  for (const line of ctx.fmt.table(headers, ...rows)) {
     ns.tprint(line);
   }
+
+  await ctx.executor.update();
+  ns.tprint(`Max grow threads: ${ctx.executor.getMaximumThreads(JobType.Grow)}`);
 }

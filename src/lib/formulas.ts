@@ -1,133 +1,125 @@
 import { NS } from '@ns';
 
-let ns: NS;
+export class Formulas {
+  private lastFormulasCheck = 0;
+  private _haveFormulas = false;
 
-export function init(_ns: NS): void {
-  ns = _ns;
-}
+  constructor(private ns: NS) {}
 
-export function moneyRatio(server: string): number {
-  return ns.getServerMoneyAvailable(server) / ns.getServerMaxMoney(server);
-}
-
-let lastFormulasCheck = 0;
-let _haveFormulas = false;
-function haveFormulas(): boolean {
-  if (Date.now() - lastFormulasCheck > 1000) {
-    lastFormulasCheck = Date.now();
-    _haveFormulas = ns.fileExists('Formulas.exe');
+  private get haveFormulas(): boolean {
+    if (Date.now() - this.lastFormulasCheck > 1000) {
+      this.lastFormulasCheck = Date.now();
+      this._haveFormulas = this.ns.fileExists('Formulas.exe');
+    }
+    return this._haveFormulas;
   }
-  return _haveFormulas;
-}
 
-export function growthForMoneyMultiplier(
-  server: string,
-  targetMultiplier: number,
-  atSecurity: number | null = null,
-): number {
-  let threads = Math.ceil(ns.growthAnalyze(server, targetMultiplier));
-  if (haveFormulas()) {
-    const serverObj = ns.getServer(server);
-    const player = ns.getPlayer();
-    serverObj.hackDifficulty = atSecurity || serverObj.minDifficulty;
-    while (ns.formulas.hacking.growPercent(serverObj, threads, player) < targetMultiplier) {
+  moneyRatio(server: string): number {
+    return this.ns.getServerMoneyAvailable(server) / this.ns.getServerMaxMoney(server);
+  }
+
+  growthForMoneyMultiplier(server: string, targetMultiplier: number, atSecurity: number | null = null): number {
+    let threads = Math.ceil(this.ns.growthAnalyze(server, targetMultiplier));
+    if (this.haveFormulas) {
+      const serverObj = this.ns.getServer(server);
+      const player = this.ns.getPlayer();
+      serverObj.hackDifficulty = atSecurity || serverObj.minDifficulty;
+      while (this.ns.formulas.hacking.growPercent(serverObj, threads, player) < targetMultiplier) {
+        threads++;
+      }
+    }
+    return threads;
+  }
+
+  growthToTargetMoneyRatio(server: string, targetMoneyRatio: number): number {
+    const currentMoneyRatio = this.moneyRatio(server);
+    const targetMultiplier = targetMoneyRatio / currentMoneyRatio;
+    return this.growthForMoneyMultiplier(server, targetMultiplier);
+  }
+
+  growthFromToMoneyRatio(server: string, from: number, to: number, atSecurity: number | null = null): number {
+    return this.growthForMoneyMultiplier(server, to / from, atSecurity);
+  }
+
+  almostEquals(a: number, b: number, epsilon: number): boolean {
+    return Math.abs(a - b) < epsilon;
+  }
+
+  getBaseLog(base: number, x: number): number {
+    return Math.log(x) / Math.log(base);
+  }
+
+  hacksFromToMoneyRatio(server: string, from: number, to: number): number {
+    const targetPercent = from - to;
+    if (this.haveFormulas) {
+      const serverObj = this.ns.getServer(server);
+      serverObj.hackDifficulty = serverObj.minDifficulty;
+      const hackPercent = this.ns.formulas.hacking.hackPercent(serverObj, this.ns.getPlayer());
+      return Math.ceil(targetPercent / hackPercent);
+      //return Math.ceil(getBaseLog(1 - hackPercent, targetPercent));
+    }
+    const targetMoneyStolen = this.ns.getServerMaxMoney(server) * targetPercent;
+    const threads = Math.floor(this.ns.hackAnalyzeThreads(server, targetMoneyStolen));
+    return threads;
+  }
+
+  weakenForSecurityDecrease(security: number): number {
+    // This makes the bold assumption that weakens are linear
+    let threads = Math.ceil(security / this.ns.weakenAnalyze(1));
+    // It seems to not work very well, and I can't find a much better way, so...
+    while (this.ns.weakenAnalyze(threads) < security) {
       threads++;
     }
+    return threads;
   }
-  return threads;
-}
 
-export function growthToTargetMoneyRatio(server: string, targetMoneyRatio: number): number {
-  const currentMoneyRatio = moneyRatio(server);
-  const targetMultiplier = targetMoneyRatio / currentMoneyRatio;
-  return growthForMoneyMultiplier(server, targetMultiplier);
-}
-
-export function growthFromToMoneyRatio(
-  server: string,
-  from: number,
-  to: number,
-  atSecurity: number | null = null,
-): number {
-  return growthForMoneyMultiplier(server, to / from, atSecurity);
-}
-
-export function almostEquals(a: number, b: number, epsilon: number): boolean {
-  return Math.abs(a - b) < epsilon;
-}
-
-export function getBaseLog(base: number, x: number): number {
-  return Math.log(x) / Math.log(base);
-}
-
-export function hacksFromToMoneyRatio(server: string, from: number, to: number): number {
-  const targetPercent = from - to;
-  if (haveFormulas()) {
-    const serverObj = ns.getServer(server);
-    serverObj.hackDifficulty = serverObj.minDifficulty;
-    const hackPercent = ns.formulas.hacking.hackPercent(serverObj, ns.getPlayer());
-    return Math.ceil(targetPercent / hackPercent);
-    //return Math.ceil(getBaseLog(1 - hackPercent, targetPercent));
+  weakenToMinimum(server: string): number {
+    return this.weakenForSecurityDecrease(
+      this.ns.getServerSecurityLevel(server) - this.ns.getServerMinSecurityLevel(server),
+    );
   }
-  const targetMoneyStolen = ns.getServerMaxMoney(server) * targetPercent;
-  const threads = Math.ceil(ns.hackAnalyzeThreads(server, targetMoneyStolen));
-  return threads;
-}
 
-export function weakenForSecurityDecrease(security: number): number {
-  // This makes the bold assumption that weakens are linear
-  let threads = Math.ceil(security / ns.weakenAnalyze(1));
-  // It seems to not work very well, and I can't find a much better way, so...
-  while (ns.weakenAnalyze(threads) < security) {
-    threads++;
+  weakenAfterHacks(hacks: number): number {
+    const security = this.ns.hackAnalyzeSecurity(hacks);
+    return this.weakenForSecurityDecrease(security);
   }
-  return threads;
-}
 
-export function weakenToMinimum(server: string): number {
-  return weakenForSecurityDecrease(ns.getServerSecurityLevel(server) - ns.getServerMinSecurityLevel(server));
-}
-
-export function weakenAfterHacks(hacks: number): number {
-  const security = ns.hackAnalyzeSecurity(hacks);
-  return weakenForSecurityDecrease(security);
-}
-
-export function weakenAfterGrows(grows: number): number {
-  const security = ns.growthAnalyzeSecurity(grows);
-  return weakenForSecurityDecrease(security);
-}
-
-export function getWeakenTime(server: string): number {
-  if (haveFormulas()) {
-    return ns.formulas.hacking.weakenTime(ns.getServer(server), ns.getPlayer());
+  weakenAfterGrows(grows: number): number {
+    const security = this.ns.growthAnalyzeSecurity(grows);
+    return this.weakenForSecurityDecrease(security);
   }
-  return ns.getWeakenTime(server);
-}
 
-export function getHackTime(server: string): number {
-  if (haveFormulas()) {
-    const serverObj = ns.getServer(server);
-    serverObj.hackDifficulty = serverObj.minDifficulty;
-    return ns.formulas.hacking.growTime(serverObj, ns.getPlayer());
+  getWeakenTime(server: string): number {
+    if (this.haveFormulas) {
+      return this.ns.formulas.hacking.weakenTime(this.ns.getServer(server), this.ns.getPlayer());
+    }
+    return this.ns.getWeakenTime(server);
   }
-  return ns.getHackTime(server);
-}
 
-export function getGrowTime(server: string): number {
-  if (haveFormulas()) {
-    const serverObj = ns.getServer(server);
-    serverObj.hackDifficulty = serverObj.minDifficulty;
-    return ns.formulas.hacking.growTime(serverObj, ns.getPlayer());
+  getHackTime(server: string): number {
+    if (this.haveFormulas) {
+      const serverObj = this.ns.getServer(server);
+      serverObj.hackDifficulty = serverObj.minDifficulty;
+      return this.ns.formulas.hacking.growTime(serverObj, this.ns.getPlayer());
+    }
+    return this.ns.getHackTime(server);
   }
-  return ns.getGrowTime(server);
-}
 
-export function estimateStableThreadCount(server: string, targetMoneyRatio: number, tickLength: number): number {
-  // This is a VERY rough estimate, but it's good enough for skipping too-small servers
-  const hacksPerBatch = hacksFromToMoneyRatio(server, 1, targetMoneyRatio);
-  const growsPerBatch = growthFromToMoneyRatio(server, targetMoneyRatio, 1);
-  const weakensPerBatch = weakenAfterGrows(growsPerBatch) + weakenAfterHacks(hacksPerBatch);
-  const concurrentBatches = getWeakenTime(server) / tickLength;
-  return Math.round((hacksPerBatch + growsPerBatch + weakensPerBatch) * concurrentBatches);
+  getGrowTime(server: string): number {
+    if (this.haveFormulas) {
+      const serverObj = this.ns.getServer(server);
+      serverObj.hackDifficulty = serverObj.minDifficulty;
+      return this.ns.formulas.hacking.growTime(serverObj, this.ns.getPlayer());
+    }
+    return this.ns.getGrowTime(server);
+  }
+
+  estimateStableThreadCount(server: string, targetMoneyRatio: number, tickLength: number): number {
+    // This is a VERY rough estimate, but it's good enough for skipping too-small servers
+    const hacksPerBatch = this.hacksFromToMoneyRatio(server, 1, targetMoneyRatio);
+    const growsPerBatch = this.growthFromToMoneyRatio(server, targetMoneyRatio, 1);
+    const weakensPerBatch = this.weakenAfterGrows(growsPerBatch) + this.weakenAfterHacks(hacksPerBatch);
+    const concurrentBatches = this.getWeakenTime(server) / tickLength;
+    return Math.round((hacksPerBatch + growsPerBatch + weakensPerBatch) * concurrentBatches);
+  }
 }

@@ -1,9 +1,9 @@
 import { NS } from '@ns';
 
-import { parseMoney } from 'lib/fmt';
+import { Fmt } from 'lib/fmt';
 
 export interface Config {
-  tickLength: number;
+  baseTickLength: number;
   timeEpsilon: number;
   statsPeriod: number;
   securityThreshold: number;
@@ -15,11 +15,13 @@ export interface Config {
   tinyWeakenTime: number;
   tinyCapacityThreshold: number;
   serverPurchaseInterval: number;
-  serverPurchaseUtilThreshold: number;
+  emergencyShutdownMoneyRatio: number;
+  retargetUtilThreshold: number;
+  retargetInterval: number;
 }
 
-const DEFAULT_CONFIG: Config = {
-  tickLength: 400, // you probably want this at timeEpsilon * 8
+export const DEFAULT_CONFIG: Config = {
+  baseTickLength: 400, // you probably want this at timeEpsilon * 8
   statsPeriod: 5000,
   securityThreshold: 5,
   timeEpsilon: 50,
@@ -31,10 +33,10 @@ const DEFAULT_CONFIG: Config = {
   tinyWeakenTime: 30000,
   tinyCapacityThreshold: 0.1,
   serverPurchaseInterval: 5000,
-  serverPurchaseUtilThreshold: 0.7,
+  emergencyShutdownMoneyRatio: 0.1,
+  retargetUtilThreshold: 0.7,
+  retargetInterval: 10000,
 };
-
-export const CONFIG = DEFAULT_CONFIG;
 
 const TimeSuffixes: { [suffix: string]: number } = {
   s: 1000,
@@ -48,17 +50,20 @@ function parseTime(x: string | number): number {
   return x;
 }
 
-let lastLoad = 0;
-const maxAge = 1000;
-
-export function loadConfig(ns: NS): void {
-  if (Date.now() - lastLoad < maxAge) {
-    return;
+export function loadConfig(ns: NS, fmt: Fmt): Config | null {
+  const s = ns.read('/autohack/config.txt');
+  if (!s) {
+    ns.print('No config file found');
+    return null;
   }
-  const config = JSON.parse(ns.read('/autohack/config.txt') || '{}') as Config;
-  if ('reservedMoney' in config) {
-    config.reservedMoney = parseMoney(config.reservedMoney);
+  try {
+    const fromFile = JSON.parse(s);
+    if ('reservedMoney' in fromFile) {
+      fromFile.reservedMoney = fmt.parseMoney(fromFile.reservedMoney);
+    }
+    return fromFile;
+  } catch (e) {
+    ns.print(`Error parsing config, ignoring the file: ${e}`);
+    return null;
   }
-  Object.assign(CONFIG, config);
-  lastLoad = Date.now();
 }
