@@ -10,7 +10,6 @@ import { Scheduler } from 'lib/scheduler';
 
 export class AutohackContext {
   readonly config: Config = DEFAULT_CONFIG;
-  private tickMultiplier = 1;
 
   readonly debug: Debug;
   readonly executor: Executor;
@@ -36,20 +35,6 @@ export class AutohackContext {
   }
 
   get tickLength(): number {
-    return this.config.baseTickLength * this.tickMultiplier;
-  }
-
-  increaseTickMultiplier(): void {
-    this.tickMultiplier += 1;
-  }
-
-  decreaseTickMultiplier(): void {
-    if (this.canDecreaseTickMultiplier) {
-      this.tickMultiplier -= 1;
-    }
-  }
-
-  get canDecreaseTickMultiplier(): boolean {
-    return this.tickMultiplier > 1;
+    return this.config.baseTickLength;
   }
 }

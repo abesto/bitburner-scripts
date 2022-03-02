@@ -53,7 +53,7 @@ class Worker {
   ) {}
 
   get isRunning(): boolean {
-    return this.ns.isRunning(this.pid, this.host.name, this.target);
+    return this.ns.isRunning(this.pid, this.host.name);
   }
 
   async kill(): Promise<boolean> {
@@ -582,7 +582,7 @@ export class Executor {
       killed += await host.emergency(target);
     }
     if (killed > 0) {
-      this.ns.print(`!!EMERGENCY!! Killed ${killed} hack threads against ${target}`);
+      this.ctx.debug.Executor_emergency(`Killed ${killed} hack threads against ${target}`);
     }
     return killed;
   }

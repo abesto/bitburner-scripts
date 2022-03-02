@@ -3,16 +3,20 @@ import { NS } from '@ns';
 import { Config } from 'lib/autohack/config';
 import { AutohackContext } from 'lib/autohack/context';
 import { JobType, Result } from 'lib/autohack/executor';
+import { AutohackSchedulerUserData } from 'lib/autohack/statemachine';
+import { HackOneServer } from 'lib/autohack/targeting';
 import { Fmt } from 'lib/fmt';
 
 class JobTypeStats {
   inProgressHistory: number[] = [];
+  queuedHistory: number[] = [];
   finished = 0;
   duration = 0;
   impact = 0;
 
   reset() {
     this.inProgressHistory = [];
+    this.queuedHistory = [];
     this.finished = 0;
     this.duration = 0;
     this.impact = 0;
@@ -29,8 +33,17 @@ export class Stats {
   private securityLevelHistory: number[] = [];
 
   private time = 0;
+  tickLength: number;
+  readonly target: string;
 
-  constructor(private ctx: AutohackContext, private target: string) {}
+  constructor(private ctx: AutohackContext, private hack: HackOneServer) {
+    this.tickLength = ctx.tickLength;
+    this.target = hack.target;
+  }
+
+  get isSteadyState(): boolean {
+    return this.hack.statemachine.isSteadyState;
+  }
 
   private get ns(): NS {
     return this.ctx.ns;
@@ -47,6 +60,7 @@ export class Stats {
   async tick(): Promise<boolean> {
     this.recordServerState();
     this.recordExecutorState();
+    this.recordSchedulerState();
     this.time += this.ctx.tickLength;
     if (this.time >= this.cfg.statsPeriod) {
       return true;
@@ -65,6 +79,33 @@ export class Stats {
     this.hacks.inProgressHistory.push(this.ctx.executor.countThreads(this.target, JobType.Hack));
     this.weakens.inProgressHistory.push(this.ctx.executor.countThreads(this.target, JobType.Weaken));
     this.hackCapacityHistory.push(this.ctx.executor.getMaximumThreads(JobType.Hack));
+  }
+
+  private recordSchedulerState() {
+    let grows = 0;
+    let weakens = 0;
+    let hacks = 0;
+    for (const task of this.ctx.scheduler.tasks) {
+      const userData = task.userData as AutohackSchedulerUserData;
+      if (userData?.__tag !== 'AutohackSchedulerUserData') {
+        continue;
+      }
+      if (userData.target !== this.target) {
+        continue;
+      }
+      if (userData.jobType === JobType.Grow) {
+        grows += userData.threads;
+      } else if (userData.jobType === JobType.Weaken) {
+        weakens += userData.threads;
+      } else if (userData.jobType === JobType.Hack) {
+        hacks += userData.threads;
+      } else {
+        throw new Error(`Unknown job type ${userData.jobType}`);
+      }
+    }
+    this.grows.queuedHistory.push(grows);
+    this.weakens.queuedHistory.push(weakens);
+    this.hacks.queuedHistory.push(hacks);
   }
 
   reset(): void {
@@ -98,7 +139,7 @@ export class Stats {
     }
   }
 
-  private formatInProgress(history: number[]): string {
+  private formatHistoryAvg(history: number[]): string {
     const sum = history.reduce((a, b) => a + b, 0);
     const avg = Math.round(sum / history.length);
     //return `${Math.min(...history)},${avg},${Math.max(...history)}`;
@@ -108,8 +149,10 @@ export class Stats {
   shortFields(): string[] {
     return [
       this.target,
-      // money ratio
-      this.fmt.float(this.moneyRatioHistory.reduce((a, b) => a + b, 0) / this.moneyRatioHistory.length),
+      // tick length
+      this.tickLength.toString(),
+      // weaken time
+      this.ctx.formulas.getWeakenTime(this.target).toString(),
       // money gained
       this.fmt.money(this.hacks.impact),
       // security over minimum
@@ -117,12 +160,18 @@ export class Stats {
         this.securityLevelHistory.reduce((a, b) => a + b, 0) / this.securityLevelHistory.length -
           this.ns.getServerMinSecurityLevel(this.target),
       ),
-      // hacks in-flight | done
-      `${this.formatInProgress(this.hacks.inProgressHistory)}/${this.hacks.finished}`,
-      // grows in-flight | done
-      `${this.formatInProgress(this.grows.inProgressHistory)}/${this.grows.finished}`,
-      // weakens in-flight | done
-      `${this.formatInProgress(this.weakens.inProgressHistory)}/${this.weakens.finished}`,
+      // hacks queued/in-flight/done
+      `${this.formatHistoryAvg(this.hacks.queuedHistory)}/${this.formatHistoryAvg(this.hacks.inProgressHistory)}/${
+        this.hacks.finished
+      }`,
+      // grows queued/in-flight/done
+      `${this.formatHistoryAvg(this.grows.queuedHistory)}/${this.formatHistoryAvg(this.grows.inProgressHistory)}/${
+        this.grows.finished
+      }`,
+      // weakens queued/in-flight/done
+      `${this.formatHistoryAvg(this.weakens.queuedHistory)}/${this.formatHistoryAvg(this.weakens.inProgressHistory)}/${
+        this.weakens.finished
+      }`,
     ];
   }
 
@@ -149,20 +198,20 @@ export class Stats {
       ],
       [
         'hacks',
-        ['proc', this.formatInProgress(this.hacks.inProgressHistory)],
+        ['proc', this.formatHistoryAvg(this.hacks.inProgressHistory)],
         ['done', this.hacks.finished.toString()],
         ['money', this.fmt.money(this.hacks.impact)],
         ['per-sec', this.fmt.money(this.hacks.impact / (this.time / 1000))],
       ],
       [
         'grows',
-        ['proc', this.formatInProgress(this.grows.inProgressHistory)],
+        ['proc', this.formatHistoryAvg(this.grows.inProgressHistory)],
         ['done', this.grows.finished.toString()],
         ['amount', this.fmt.float(this.grows.impact)],
       ],
       [
         'weakens',
-        ['proc', this.formatInProgress(this.weakens.inProgressHistory)],
+        ['proc', this.formatHistoryAvg(this.weakens.inProgressHistory)],
         ['done', this.weakens.finished.toString()],
         ['amount', this.fmt.float(this.weakens.impact)],
       ],
@@ -198,10 +247,6 @@ export class AggStats {
     this.stats.push(stats);
   }
 
-  unregister(stats: Stats): void {
-    this.stats = this.stats.filter(s => s !== stats);
-  }
-
   async tick(): Promise<boolean> {
     for (const stats of this.stats) {
       await stats.tick();
@@ -224,33 +269,47 @@ export class AggStats {
   }
 
   print(): void {
-    const rows = this.stats.map(s => s.shortFields()).filter(r => r[6] !== '0/0' || r[5] !== '0/0');
-    const money = rows.map(r => this.fmt.parseMoney(r[2])).reduce((a, b) => a + b, 0);
+    const rows = this.stats
+      .filter(s => s.isSteadyState)
+      .map(s => s.shortFields())
+      .filter(r => !r.slice(5, 8).includes('0/0/0'));
+    rows.sort((a, b) => parseInt(a[2]) - parseInt(b[2]));
+    const money = rows.map(r => this.fmt.parseMoney(r[3])).reduce((a, b) => a + b, 0);
     this.lifetimeMoney += money;
     const now = Date.now();
     this.lastMinuteMoney.push({ money, time: now });
     this.lastMinuteMoney = this.lastMinuteMoney.filter(m => m.time > now - 60 * 1000);
     this.ns.print(`== Stats at ${new Date()} after ${this.fmt.time(this.time)} ==`);
+    const aggHistory = (field: number) =>
+      rows
+        .map(r => r[field].split('/').map(n => parseInt(n)))
+        .reduce((a, b) => [a[0] + b[0], a[1] + b[1], a[2] + b[2]], [0, 0, 0])
+        .map(n => this.fmt.intShort(n))
+        .join('/');
     const totals = [
       'TOTAL/AVG',
       this.fmt.float(rows.map(r => parseFloat(r[1])).reduce((a, b) => a + b, 0) / rows.length),
+      this.fmt.timeShort(rows.map(r => parseFloat(r[2])).reduce((a, b) => a + b, 0) / rows.length),
       this.fmt.money(money),
-      this.fmt.float(rows.map(r => parseFloat(r[3])).reduce((a, b) => a + b, 0)),
-      rows
-        .map(r => r[4].split('/').map(s => parseInt(s)))
-        .reduce((a, b) => [a[0] + b[0], a[1] + b[1]], [0, 0])
-        .join('/'),
-      rows
-        .map(r => r[5].split('/').map(s => parseInt(s)))
-        .reduce((a, b) => [a[0] + b[0], a[1] + b[1]], [0, 0])
-        .join('/'),
-      rows
-        .map(r => r[6].split('/').map(s => parseInt(s)))
-        .reduce((a, b) => [a[0] + b[0], a[1] + b[1]], [0, 0])
-        .join('/'),
+      this.fmt.float(rows.map(r => parseFloat(r[4])).reduce((a, b) => a + b, 0)),
+      aggHistory(5),
+      aggHistory(6),
+      aggHistory(7),
     ];
+
+    const fmtHistory = (s: string) =>
+      s
+        .split('/')
+        .map(n => this.fmt.intShort(parseInt(n)))
+        .join('/');
+    for (const row of rows) {
+      row[2] = this.fmt.timeShort(parseFloat(row[2]));
+      row[5] = fmtHistory(row[5]);
+      row[6] = fmtHistory(row[6]);
+      row[7] = fmtHistory(row[7]);
+    }
     for (const line of this.fmt.table(
-      ['target', 'money-ratio', 'gain', 'security-over-min', 'hacks', 'grows', 'weakens'],
+      ['TARGET', 'TICK-LENGTH', 'WEAKEN-TIME', 'GAIN', 'SEC-OVER', 'HACKS', 'GROWS', 'WEAKENS'],
       ...rows,
       totals,
     )) {
@@ -259,13 +318,18 @@ export class AggStats {
     this.ns.print(
       this.fmt.keyValue(
         ['util', this.fmt.float(this.ctx.executor.utilization)],
-        ['tick-length', `${this.ctx.tickLength}ms`],
-        ['uptime', this.fmt.time(this.lifetime)],
-        ['money', this.fmt.money(this.lifetimeMoney)],
         ['money/sec', this.fmt.money(this.lifetimeMoney / (this.lifetime / 1000))],
         [
           'money/sec@1min',
           this.fmt.money(this.lastMinuteMoney.reduce((a, b) => a + b.money, 0) / Math.min(60, this.lifetime / 1000)),
+        ],
+        ['max-grows', this.fmt.intShort(this.ctx.executor.getMaximumThreads(JobType.Grow))],
+        [
+          'initial-grow',
+          this.stats
+            .filter(s => !s.isSteadyState)
+            .map(s => s.target)
+            .join(', '),
         ],
       ),
     );

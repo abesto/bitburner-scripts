@@ -1,7 +1,7 @@
-separate tick multiplier by server / statemachine. targeting can then pick new servers once utilization is low, even if tick length needs to be high on the new targets
-config: don't explode if it's invalid, print and ignore
-fill capacity with grow/weaken jobs to farm xp? maybe as a separate script
-pump (grow) companies stock.js invests in?
-improve stats to better match new scheduling system
-  add nr. of queued jobs
+spread out ticks of target servers across a tick to minimize impact of runtime variance on latter hacks
+  needs a stable offset per server (modulo server limit). hash the server name (and store it, as micro-optimization).
+stopping processes via Worker seems to not work?
+"shutting down hacks" probably doesn't cancel scheduled tasks in the Scheduler
+  maybe we shouldn't shut running stuff down, we already paid for part of it, may as well get the value
+another optimization pass
 grafana through downloaded files?

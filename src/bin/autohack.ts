@@ -1,13 +1,10 @@
 import { NS } from '@ns';
 
-import { Config } from 'lib/autohack/config';
 import { AutohackContext } from 'lib/autohack/context';
-import { Executor, JobType, Result } from 'lib/autohack/executor';
-import { Statemachine } from 'lib/autohack/statemachine';
-import { Stats } from 'lib/autohack/stats';
+import { JobType } from 'lib/autohack/executor';
+import { HackOneServer } from 'lib/autohack/targeting';
 import { autonuke } from 'lib/autonuke';
 import { discoverHackedHosts } from 'lib/distributed';
-import { Formulas } from 'lib/formulas';
 
 async function deleteWeakestWorker(ctx: AutohackContext, keep: number): Promise<string | null> {
   const ns = ctx.ns;
@@ -79,54 +76,10 @@ async function purchaseWorkers(ctx: AutohackContext): Promise<PurchaseResult> {
   return result;
 }
 
-class HackOneServer {
-  private stats: Stats;
-  private statemachine: Statemachine;
-
-  constructor(private ctx: AutohackContext, private target: string) {
-    this.stats = new Stats(ctx, target);
-    this.statemachine = new Statemachine(ctx, target);
-    ctx.aggStats.addStats(this.stats);
-  }
-
-  private get formulas(): Formulas {
-    return this.ctx.formulas;
-  }
-
-  private get config(): Config {
-    return this.ctx.config;
-  }
-
-  private get executor(): Executor {
-    return this.ctx.executor;
-  }
-
-  async shutdown(): Promise<void> {
-    await this.executor.killWorkers(JobType.Hack, this.target);
-    await this.executor.killWorkers(JobType.Grow, this.target);
-    await this.executor.killWorkers(JobType.Weaken, this.target);
-    this.ctx.aggStats.unregister(this.stats);
-  }
-
-  async tick(): Promise<void> {
-    if (this.ctx.ns.getServerMoneyAvailable(this.target) === 0) {
-      this.ctx.ns.print(`Uh-oh, no money left on ${this.target}`);
-    }
-    await this.stats.tick();
-    await this.statemachine.tick();
-    if (this.formulas.moneyRatio(this.target) < this.config.emergencyShutdownMoneyRatio) {
-      await this.executor.emergency(this.target);
-    }
-  }
-
-  handleResults(results: Result[]): void {
-    this.stats.handleResults(results);
-  }
-}
-
 export async function main(ns: NS): Promise<void> {
   ns.disableLog('ALL');
   const ctx = new AutohackContext(ns);
+  ctx.loadConfig();
 
   const action = ns.args[0];
   if (action === 'kill') {
@@ -149,68 +102,68 @@ export async function main(ns: NS): Promise<void> {
   };
   await getMoreServers();
 
-  const hacks: { [server: string]: HackOneServer } = {};
+  const allHacks: HackOneServer[] = [];
+  let activeHacks: HackOneServer[] = [];
 
   // Hack more servers!
   const hackMore = async () => {
-    let sleep = ctx.config.retargetInterval;
     const util = ctx.executor.utilization;
     if (util < ctx.config.retargetUtilThreshold) {
-      const servers = discoverHackedHosts(ns);
-
       const capacity = ctx.executor.getMaximumThreads(JobType.Grow);
-      const capacityToHack = (s: string) =>
-        ctx.formulas.estimateStableThreadCount(s, ctx.config.targetMoneyRatio, ctx.tickLength) / capacity;
+      const capacityToHack = (s: string, tickLength: number) =>
+        ctx.formulas.estimateStableThreadCount(s, ctx.config.targetMoneyRatio, tickLength) / capacity;
 
-      const candidates = servers.filter(s => ns.getServerMaxMoney(s) > 0 && capacityToHack(s) < 1);
-      candidates.sort((a, b) => capacityToHack(b) - capacityToHack(a));
-
-      if (candidates.length === 0) {
-        ctx.increaseTickMultiplier();
-        ns.print(`No servers small enough to hack. Reducing tick length and trying again.`);
-        sleep = 0;
-      } else {
-        // Minimize tick length multiplier based on the smallest server
-        while (capacityToHack(candidates[0]) < 1 && ctx.canDecreaseTickMultiplier) {
-          ctx.decreaseTickMultiplier();
-        }
-        if (capacityToHack(candidates[0]) > 1) {
-          ctx.increaseTickMultiplier();
-        }
-
-        // Find the ctx.config.concurrentTargets largest servers that best use our capacity
-        const newTargets: string[] = [];
-        const consumed = () => newTargets.map(s => capacityToHack(s)).reduce((a, b) => a + b, 0);
-        while (consumed() < 1.1 && candidates.length > 0) {
-          const target = candidates.shift();
-          if (target) {
-            newTargets.push(target);
-            while (newTargets.length > ctx.config.concurrentTargets) {
-              newTargets.shift();
-            }
-          }
-        }
-
-        // Stop hacks against servers we don't want to hack anymore
-        for (const target in hacks) {
-          if (!newTargets.includes(target)) {
-            await hacks[target].shutdown();
-            ns.print(`Shutting down hacks against ${target}`);
-            delete hacks[target];
-          }
-        }
-
-        // Start hacks against servers we newly want to hack
-        for (const target of newTargets) {
-          if (!(target in hacks)) {
-            hacks[target] = new HackOneServer(ctx, target);
-            ns.print(`Starting autohack against ${target}`);
+      for (const server of discoverHackedHosts(ns).filter(s => ns.getServerMaxMoney(s))) {
+        if (!allHacks.find(h => h.target === server)) {
+          const hack = new HackOneServer(ctx, server);
+          allHacks.push(hack);
+          if (!hack.statemachine.isSteadyState) {
+            await hack.tick();
+            ctx.debug.Targeting_prepare(`Prepping ${hack.target}`);
           }
         }
       }
+      allHacks.sort((a, b) => capacityToHack(a.target, ctx.tickLength) - capacityToHack(b.target, ctx.tickLength));
+
+      const toActivate: HackOneServer[] = [];
+      const consumed = () => toActivate.map(h => capacityToHack(h.target, h.tickLength)).reduce((a, b) => a + b, 0);
+      for (const hack of allHacks) {
+        if (consumed() >= ctx.config.pickServersUpToUtil) {
+          break;
+        }
+        if (!hack.statemachine.isSteadyState) {
+          continue;
+        }
+        hack.resetTickLength();
+        toActivate.push(hack);
+        if (toActivate.length > ctx.config.concurrentTargets) {
+          toActivate.shift();
+        }
+      }
+
+      let toWeaken = toActivate.length - 1;
+      while (consumed() > ctx.config.slowServersDownToUtil && toWeaken >= 0) {
+        toActivate[toWeaken].increaseTickLength();
+        if (!toActivate[toWeaken].canIncreaseTickLength) {
+          toWeaken -= 1;
+        }
+      }
+
+      // Stop hacks against servers we don't want to hack anymore
+      for (const hack of activeHacks) {
+        if (!toActivate.includes(hack)) {
+          await hack.shutdown();
+          ns.print(`Shutting down hacks against ${hack.target}`);
+        }
+      }
+
+      activeHacks = toActivate;
+
+      ctx.debug.Targeting_maxUtil(`expected-util=${consumed()}`);
     }
 
-    ctx.scheduler.setTimeout(hackMore, sleep);
+    ctx.debug.Targeting_active(activeHacks.map(h => h.target).join(', '));
+    ctx.scheduler.setTimeout(hackMore, 10000);
   };
   await hackMore();
 
@@ -226,7 +179,7 @@ export async function main(ns: NS): Promise<void> {
 
     // Run hacks
     const results = await ctx.executor.update();
-    for (const hack of Object.values(hacks)) {
+    for (const hack of activeHacks) {
       hack.handleResults(results);
       await hack.tick();
       await ns.asleep(0);

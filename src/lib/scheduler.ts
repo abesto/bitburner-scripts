@@ -4,8 +4,9 @@ type When = number | (() => number);
 
 interface Task {
   when: When;
-  what: () => Promise<void>;
+  what: () => Promise<unknown>;
   name?: string;
+  userData?: unknown;
 }
 
 function when(t: Task): number {
@@ -33,6 +34,10 @@ export class Scheduler {
     if (index !== -1) {
       this.tasks.splice(index, 1);
     }
+  }
+
+  getTasks(): Task[] {
+    return this.tasks.slice();
   }
 
   async run(): Promise<number> {

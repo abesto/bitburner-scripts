@@ -25,10 +25,10 @@ export class Formulas {
       const player = this.ns.getPlayer();
       serverObj.hackDifficulty = atSecurity || serverObj.minDifficulty;
       while (this.ns.formulas.hacking.growPercent(serverObj, threads, player) < targetMultiplier) {
-        threads++;
+        threads *= 1.01;
       }
     }
-    return threads;
+    return Math.ceil(threads);
   }
 
   growthToTargetMoneyRatio(server: string, targetMoneyRatio: number): number {
@@ -100,7 +100,7 @@ export class Formulas {
     if (this.haveFormulas) {
       const serverObj = this.ns.getServer(server);
       serverObj.hackDifficulty = serverObj.minDifficulty;
-      return this.ns.formulas.hacking.growTime(serverObj, this.ns.getPlayer());
+      return this.ns.formulas.hacking.hackTime(serverObj, this.ns.getPlayer());
     }
     return this.ns.getHackTime(server);
   }

@@ -20,8 +20,16 @@ export class Fmt {
     return this.ns.nFormat(n, Formats.float);
   }
 
+  intShort(n: number): string {
+    return this.ns.nFormat(n, '0a');
+  }
+
   time(t: number): string {
     return this.ns.tFormat(t);
+  }
+
+  timeShort(t: number): string {
+    return this.ns.nFormat(t / 1000, '00:00:00');
   }
 
   keyValue(...items: [string, string][]): string {

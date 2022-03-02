@@ -9,17 +9,33 @@ import { Formulas } from 'lib/formulas';
 import { Scheduler } from 'lib/scheduler';
 
 enum State {
-  Startup,
   InitialGrow,
   Hacking,
 }
 
+export interface AutohackSchedulerUserData {
+  target: string;
+  jobType: JobType;
+  threads: number;
+  __tag: 'AutohackSchedulerUserData';
+}
+
 export class Statemachine {
-  private state: State = State.Startup;
+  private state: State;
   private dbg: Debug;
 
   constructor(private ctx: AutohackContext, private target: string) {
     this.dbg = this.ctx.debug.withCategoryPrefix(`Statemachine_${target}`);
+    if (this.fm.moneyRatio(this.target) < this.cfg.targetMoneyRatio ** 2) {
+      this.state = State.InitialGrow;
+    } else {
+      this.state = State.Hacking;
+    }
+    this.dbg.Transition(`Booting into ${this.state}`);
+  }
+
+  get isSteadyState(): boolean {
+    return this.state === State.Hacking;
   }
 
   private get ns(): NS {
@@ -44,9 +60,6 @@ export class Statemachine {
 
   async tick(): Promise<void> {
     switch (this.state) {
-      case State.Startup:
-        await this.startup();
-        break;
       case State.InitialGrow:
         await this.initialGrow();
         break;
@@ -56,34 +69,53 @@ export class Statemachine {
     }
   }
 
-  private async startup(): Promise<void> {
-    // Discover whether we're in the initial grow phase.
-    if (this.fm.moneyRatio(this.target) < this.cfg.targetMoneyRatio ** 2) {
-      this.state = State.InitialGrow;
-    } else {
-      this.state = State.Hacking;
-    }
-    this.dbg.Transition(`Booting into ${this.state}`);
-    await this.tick();
-  }
-
   private async initialGrow(): Promise<void> {
     // Grow until we're at the target money ratio.
     if (
       this.fm.moneyRatio(this.target) < 1 ||
       this.ns.getServerSecurityLevel(this.target) > this.ns.getServerMinSecurityLevel(this.target)
     ) {
-      const grows = this.fm.growthToTargetMoneyRatio(this.target, 1);
-      await this.executor.execUpTo(this.target, JobType.Grow, grows);
-      await this.executor.execUpTo(
-        this.target,
-        JobType.Weaken,
-        this.fm.weakenAfterGrows(grows) + this.fm.weakenToMinimum(this.target),
-      );
+      const weakenBefore = this.fm.weakenToMinimum(this.target);
+      const weakenBeforeFinishesIn = this.fm.getWeakenTime(this.target);
+      const growFinishesIn = weakenBeforeFinishesIn + this.cfg.timeEpsilon * 2;
+      const grow = this.fm.growthToTargetMoneyRatio(this.target, 1);
+      const weakenAfter = this.fm.weakenAfterGrows(grow);
+      const weakenAfterFinishesIn = growFinishesIn + this.cfg.timeEpsilon * 2;
+
+      await this.executor.execUpTo(this.target, JobType.Weaken, weakenBefore);
+
+      this.scheduler.schedule({
+        name: 'initial-grow',
+        when: growFinishesIn - this.fm.getGrowTime(this.target),
+        userData: {
+          target: this.target,
+          jobType: JobType.Grow,
+          threads: grow,
+          __tag: 'AutohackSchedulerUserData',
+        },
+        what: () => this.executor.execUpTo(this.target, JobType.Grow, grow),
+      });
+
+      this.scheduler.schedule({
+        name: 'initial-weaken-after',
+        when: weakenAfterFinishesIn - this.fm.getWeakenTime(this.target),
+        userData: {
+          target: this.target,
+          jobType: JobType.Weaken,
+          threads: weakenAfter,
+          __tag: 'AutohackSchedulerUserData',
+        },
+        what: () => this.executor.execUpTo(this.target, JobType.Weaken, weakenAfter),
+      });
+
+      this.scheduler.schedule({
+        name: 'initial-done',
+        when: weakenAfterFinishesIn + this.cfg.timeEpsilon * 2,
+        what: () => this.initialGrow(),
+      });
     } else {
       this.state = State.Hacking;
-      this.dbg.Transition('Initial grow complete, switching to hacking');
-      await this.tick();
+      this.dbg.Transition(`Grow finished, switching to hacking`);
     }
   }
 
@@ -157,6 +189,12 @@ export class Statemachine {
         }
       },
       when: hackWeakenWillFinishIn - fm.getWeakenTime(target),
+      userData: {
+        target,
+        jobType: JobType.Weaken,
+        threads: hackWeakensWanted,
+        __tag: 'AutohackSchedulerUserData',
+      },
     });
 
     // Schedule grows
@@ -169,6 +207,12 @@ export class Statemachine {
         }
       },
       when: startGrowsIn,
+      userData: {
+        target,
+        jobType: JobType.Grow,
+        threads: growsWanted,
+        __tag: 'AutohackSchedulerUserData',
+      },
     });
 
     // Schedule grow-weakens
@@ -180,12 +224,24 @@ export class Statemachine {
         }
       },
       when: growWeakenWillFinishIn - fm.getWeakenTime(target),
+      userData: {
+        target,
+        jobType: JobType.Weaken,
+        threads: growWeakensWanted,
+        __tag: 'AutohackSchedulerUserData',
+      },
     });
 
     // Schedule hacks
     const hackWillFinishAt = now + hackWillFinishIn;
-    const cancelHacks = this.scheduler.schedule({
+    let cancelHacks = this.scheduler.schedule({
       name: 'start-hacks-wrapper',
+      userData: {
+        target,
+        jobType: JobType.Hack,
+        threads: hacksWanted,
+        __tag: 'AutohackSchedulerUserData',
+      },
       what: async () => {
         if (hacksWanted < 1) {
           dbg.noHacksNeeded(`hacksWanted=${hacksWanted}`);
@@ -199,11 +255,7 @@ export class Statemachine {
         );
 
         if (growsBefore === null && growsAfter === null) {
-          dbg.noGrows(
-            `Didn't find grows either before or after the hack finish time (in ${fmt.time(
-              hackWillFinishIn,
-            )}), so can't schedule hacks`,
-          );
+          dbg.noGrows(`Didn't find grows either before or after the hack finish time, so can't schedule hacks`);
         } else if (growsBefore === null && growsAfter !== null) {
           dbg.noGrowsBefore(
             `Didn't find grows before hack finish time; first grow after is in ${fmt.time(growsAfter.when - now)}`,
@@ -219,8 +271,14 @@ export class Statemachine {
 
         const startTime = growsAfter.when - Date.now() - 2 * this.cfg.timeEpsilon - fm.getHackTime(target);
         dbg.hacks(`Will start ${hacksWanted} hacks in ${fmt.time(startTime)}`);
-        this.scheduler.schedule({
+        cancelHacks = this.scheduler.schedule({
           name: 'start-hacks',
+          userData: {
+            target,
+            jobType: JobType.Hack,
+            threads: hacksWanted,
+            __tag: 'AutohackSchedulerUserData',
+          },
           what: async () => {
             const hacksExist = this.executor.countThreadsFinishingBetween(
               JobType.Hack,

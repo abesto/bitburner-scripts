@@ -8,8 +8,6 @@ import { discoverHackedHosts } from 'lib/distributed';
 export async function main(ns: NS): Promise<void> {
   const ctx = new AutohackContext(ns);
   ctx.loadConfig();
-  const hosts = discoverHackedHosts(ns);
-  hosts.sort((a, b) => ns.getServerMaxMoney(a) - ns.getServerMaxMoney(b));
 
   const flags = ns.flags([
     ['host', ''],
@@ -18,6 +16,10 @@ export async function main(ns: NS): Promise<void> {
   ]);
   // @ts-ignore
   ns.tprint(ctx.fmt.keyValue(...Object.entries(flags).map(([k, v]) => [k, v.toString()])));
+
+  const hosts = discoverHackedHosts(ns);
+  const score = (s: string) => ctx.formulas.estimateStableThreadCount(s, flags.targetMoneyRatio, flags.tickLength);
+  hosts.sort((a, b) => score(a) - score(b));
 
   const headers = [
     'Host',

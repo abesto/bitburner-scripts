@@ -12,12 +12,12 @@ export interface Config {
   reservedRam: number;
   debug: string[];
   concurrentTargets: number;
-  tinyWeakenTime: number;
-  tinyCapacityThreshold: number;
   serverPurchaseInterval: number;
   emergencyShutdownMoneyRatio: number;
   retargetUtilThreshold: number;
   retargetInterval: number;
+  pickServersUpToUtil: number;
+  slowServersDownToUtil: number;
 }
 
 export const DEFAULT_CONFIG: Config = {
@@ -30,12 +30,12 @@ export const DEFAULT_CONFIG: Config = {
   reservedRam: 16,
   debug: [],
   concurrentTargets: 5,
-  tinyWeakenTime: 30000,
-  tinyCapacityThreshold: 0.1,
   serverPurchaseInterval: 5000,
   emergencyShutdownMoneyRatio: 0.1,
   retargetUtilThreshold: 0.7,
   retargetInterval: 10000,
+  pickServersUpToUtil: 1.1,
+  slowServersDownToUtil: 0.9,
 };
 
 const TimeSuffixes: { [suffix: string]: number } = {
