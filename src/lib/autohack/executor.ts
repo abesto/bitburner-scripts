@@ -60,7 +60,7 @@ class Worker {
     if (!this.isRunning) {
       return false;
     }
-    const success = await this.ns.kill(this.pid);
+    const success = this.ns.kill(this.pid);
     if (!success) {
       this.ns.print(`${this.host.name} failed to kill ${this.type} ${this.pid}`);
       for (const p of this.ns.ps(this.host.name)) {

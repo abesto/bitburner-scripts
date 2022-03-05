@@ -1,7 +1,6 @@
-spread out ticks of target servers across a tick to minimize impact of runtime variance on latter hacks
-  needs a stable offset per server (modulo server limit). hash the server name (and store it, as micro-optimization).
-stopping processes via Worker seems to not work?
+stopping processes via Worker seems to not work? or at least only if executed multiple times?
 "shutting down hacks" probably doesn't cancel scheduled tasks in the Scheduler
   maybe we shouldn't shut running stuff down, we already paid for part of it, may as well get the value
 another optimization pass
+un-clown Stats / AggStats interface
 grafana through downloaded files?

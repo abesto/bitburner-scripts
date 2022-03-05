@@ -32,9 +32,9 @@ export class Stats {
   private moneyRatioHistory: number[] = [];
   private securityLevelHistory: number[] = [];
 
-  private time = 0;
   tickLength: number;
   readonly target: string;
+  private lastPrintAt = Date.now();
 
   constructor(private ctx: AutohackContext, private hack: HackOneServer) {
     this.tickLength = ctx.tickLength;
@@ -57,11 +57,14 @@ export class Stats {
     return this.ctx.fmt;
   }
 
+  private get time(): number {
+    return this.lastPrintAt - Date.now();
+  }
+
   async tick(): Promise<boolean> {
     this.recordServerState();
     this.recordExecutorState();
     this.recordSchedulerState();
-    this.time += this.ctx.tickLength;
     if (this.time >= this.cfg.statsPeriod) {
       return true;
     }
@@ -112,7 +115,7 @@ export class Stats {
     this.hacks.reset();
     this.grows.reset();
     this.weakens.reset();
-    this.time = 0;
+    this.lastPrintAt = Date.now();
     this.moneyRatioHistory = [];
     this.securityLevelHistory = [];
     this.hackCapacityHistory = [];

@@ -43,7 +43,7 @@ export class HackOneServer {
     return Math.pow(2, exp || this.tickLengthExp);
   }
 
-  resetTickLength() {
+  resetTickLength(): void {
     this.tickLengthExp = 0;
     this.stats.tickLength = this.tickLength;
   }

@@ -52,9 +52,8 @@ export class Scheduler {
       await task.what();
       const duration = Date.now() - start;
       if (duration > 50) {
-        this.ns.print(`[scheduler] Finished ${name} in ${Math.round(Date.now() - start)}ms`);
+        this.ns.print(`[scheduler] Finished ${name} in ${Math.round(duration)}ms`);
       }
-      //this.ns.tprint(`[scheduler] Finished ${name} in ${duration}ms`);
       this.cancel(task);
       await this.ns.asleep(0);
     }

@@ -76,6 +76,63 @@ async function purchaseWorkers(ctx: AutohackContext): Promise<PurchaseResult> {
   return result;
 }
 
+class StaggeredHacks {
+  private data: Map<number, HackOneServer[]> = new Map();
+  private active: Set<string> = new Set();
+
+  constructor(private ctx: AutohackContext) {}
+
+  private hash(hack: HackOneServer): number {
+    let sum = 0;
+    for (let i = 0; i < hack.target.length; i += 1) {
+      sum += hack.target.charCodeAt(i);
+    }
+    return sum % this.ctx.config.concurrentTargets;
+  }
+
+  add(hack: HackOneServer): void {
+    if (!this.data.has(this.hash(hack))) {
+      this.data.set(this.hash(hack), []);
+    }
+    this.data.get(this.hash(hack))?.push(hack);
+  }
+
+  getActive(bucket: number | null = null): HackOneServer[] {
+    return this.getAll(bucket).filter(hack => this.active.has(hack.target));
+  }
+
+  getAll(bucket: number | null = null): HackOneServer[] {
+    if (bucket === null) {
+      return Array.from(this.data.values()).flat();
+    }
+    return this.data.get(bucket) || [];
+  }
+
+  rehash(): void {
+    const newData: Map<number, HackOneServer[]> = new Map();
+    for (const value of this.data.values()) {
+      for (const hack of value) {
+        if (!newData.has(this.hash(hack))) {
+          newData.set(this.hash(hack), []);
+        }
+        newData.get(this.hash(hack))?.push(hack);
+      }
+    }
+    this.data = newData;
+  }
+
+  activate(hacks: HackOneServer[]): void {
+    for (const hack of hacks) {
+      this.active.add(hack.target);
+    }
+  }
+
+  async deactivate(hack: HackOneServer): Promise<void> {
+    this.active.delete(hack.target);
+    await hack.shutdown();
+  }
+}
+
 export async function main(ns: NS): Promise<void> {
   ns.disableLog('ALL');
   const ctx = new AutohackContext(ns);
@@ -103,7 +160,9 @@ export async function main(ns: NS): Promise<void> {
   await getMoreServers();
 
   const allHacks: HackOneServer[] = [];
-  let activeHacks: HackOneServer[] = [];
+
+  // Offset computations per target server to minimize impact of calculation runtime variance
+  const staggered = new StaggeredHacks(ctx);
 
   // Hack more servers!
   const hackMore = async () => {
@@ -117,6 +176,7 @@ export async function main(ns: NS): Promise<void> {
         if (!allHacks.find(h => h.target === server)) {
           const hack = new HackOneServer(ctx, server);
           allHacks.push(hack);
+          staggered.add(hack);
           if (!hack.statemachine.isSteadyState) {
             await hack.tick();
             ctx.debug.Targeting_prepare(`Prepping ${hack.target}`);
@@ -150,19 +210,24 @@ export async function main(ns: NS): Promise<void> {
       }
 
       // Stop hacks against servers we don't want to hack anymore
-      for (const hack of activeHacks) {
+      for (const hack of staggered.getActive()) {
         if (!toActivate.includes(hack)) {
-          await hack.shutdown();
+          await staggered.deactivate(hack);
           ns.print(`Shutting down hacks against ${hack.target}`);
         }
       }
 
-      activeHacks = toActivate;
+      staggered.activate(toActivate);
 
       ctx.debug.Targeting_maxUtil(`expected-util=${consumed()}`);
     }
 
-    ctx.debug.Targeting_active(activeHacks.map(h => h.target).join(', '));
+    ctx.debug.Targeting_active(
+      staggered
+        .getActive()
+        .map(h => h.target)
+        .join(', '),
+    );
     ctx.scheduler.setTimeout(hackMore, 10000);
   };
   await hackMore();
@@ -174,26 +239,53 @@ export async function main(ns: NS): Promise<void> {
   };
   await runAutonuke();
 
-  const tick = async () => {
-    ctx.loadConfig();
-
-    // Run hacks
-    const results = await ctx.executor.update();
-    for (const hack of activeHacks) {
-      hack.handleResults(results);
-      await hack.tick();
-      await ns.asleep(0);
+  // Server staggering needs to change when number of concurrent targets changes
+  let lastConcurrentTargets = ctx.config.concurrentTargets;
+  const rehash = async () => {
+    if (lastConcurrentTargets !== ctx.config.concurrentTargets) {
+      staggered.rehash();
+      lastConcurrentTargets = ctx.config.concurrentTargets;
     }
-    await ctx.aggStats.tick();
-
-    // Schedule next tick
-    // Round tick times so that (re)starting the script doesn't offset batches
-    const nextTickAt = Math.round(((Date.now() + ctx.tickLength) * ctx.tickLength) / ctx.tickLength);
-    ctx.scheduler.setTimeout(tick, nextTickAt - Date.now());
+    ctx.scheduler.setTimeout(rehash, ctx.config.baseTickLength * 10);
   };
+  await rehash();
+
+  const bucketLength = () => ctx.config.baseTickLength / (ctx.config.concurrentTargets + 1);
+  const floorTo = (n: number, period: number) => Math.floor(n / period) * period;
+  const tick = (bucket: number) => async () => {
+    if (bucket >= ctx.config.concurrentTargets) {
+      // Last bucket for this tick; do bookkeeping
+      // Load any config changes
+      ctx.loadConfig();
+      // Look around the world
+      const results = await ctx.executor.update();
+      for (const hack of allHacks) {
+        hack.handleResults(results);
+      }
+      // Count numbers
+      await ctx.aggStats.tick();
+      // And go again
+      const now = Date.now();
+      const nextTickAt = floorTo(now + bucketLength(), ctx.tickLength);
+      ctx.scheduler.schedule({ name: 'tick/0', what: tick(0), when: nextTickAt - Date.now() });
+    } else {
+      // Handle hacks in this bucket, and schedule the next bucket
+      const hacks = staggered.getActive(bucket);
+      for (const hack of hacks) {
+        await hack.tick();
+        await ns.asleep(0);
+      }
+      const now = Date.now();
+      ctx.scheduler.schedule({
+        name: `tick/${bucket + 1}`,
+        what: tick(bucket + 1),
+        when: floorTo(now, bucketLength()) + bucketLength() - now,
+      });
+    }
+  };
+  await tick(0)();
 
   // Hey it's an "event loop"
-  await tick();
   while (true) {
     const sleepAmount = await ctx.scheduler.run();
     if (sleepAmount > 0) {
